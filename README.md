@@ -1,3 +1,8 @@
+Fork of the rust redis client. 
+Currently just contians minor changes re: EVALSHA commands in cluster pipelines
+
+***
+
 # redis-rs
 
 [![Rust](https://github.com/redis-rs/redis-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/redis-rs/redis-rs/actions/workflows/rust.yml)
