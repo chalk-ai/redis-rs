@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
@@ -12,7 +13,7 @@ use crate::parser::Parser;
 use crate::pipeline::Pipeline;
 use crate::types::{
     from_redis_value, ErrorKind, FromRedisValue, HashMap, PushKind, RedisError, RedisResult,
-    ToRedisArgs, Value,
+    SyncPushSender, ToRedisArgs, Value,
 };
 use crate::{from_owned_redis_value, ProtocolVersion};
 
@@ -28,7 +29,6 @@ use rustls::{RootCertStore, StreamOwned};
 #[cfg(feature = "tls-rustls")]
 use std::sync::Arc;
 
-use crate::push_manager::PushManager;
 use crate::PushInfo;
 
 #[cfg(all(
@@ -255,6 +255,7 @@ impl IntoConnectionInfo for ConnectionInfo {
 /// - Specifying DB: `redis://127.0.0.1:6379/0`
 /// - Enabling TLS: `rediss://127.0.0.1:6379`
 /// - Enabling Insecure TLS: `rediss://127.0.0.1:6379/#insecure`
+/// - Enabling RESP3: `redis://127.0.0.1:6379/?protocol=resp3`
 impl<'a> IntoConnectionInfo for &'a str {
     fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
         match parse_redis_url(self) {
@@ -284,6 +285,7 @@ where
 /// - Specifying DB: `redis://127.0.0.1:6379/0`
 /// - Enabling TLS: `rediss://127.0.0.1:6379`
 /// - Enabling Insecure TLS: `rediss://127.0.0.1:6379/#insecure`
+/// - Enabling RESP3: `redis://127.0.0.1:6379/?protocol=resp3`
 impl IntoConnectionInfo for String {
     fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
         match parse_redis_url(&self) {
@@ -291,6 +293,25 @@ impl IntoConnectionInfo for String {
             None => fail!((ErrorKind::InvalidClientConfig, "Redis URL did not parse")),
         }
     }
+}
+
+fn parse_protocol(query: &HashMap<Cow<str>, Cow<str>>) -> RedisResult<ProtocolVersion> {
+    Ok(match query.get("protocol") {
+        Some(protocol) => {
+            if protocol == "2" || protocol == "resp2" {
+                ProtocolVersion::RESP2
+            } else if protocol == "3" || protocol == "resp3" {
+                ProtocolVersion::RESP3
+            } else {
+                fail!((
+                    ErrorKind::InvalidClientConfig,
+                    "Invalid protocol version",
+                    protocol.to_string()
+                ))
+            }
+        }
+        None => ProtocolVersion::RESP2,
+    })
 }
 
 fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
@@ -378,16 +399,7 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
                 },
                 None => None,
             },
-            protocol: match query.get("resp3") {
-                Some(v) => {
-                    if v == "true" {
-                        ProtocolVersion::RESP3
-                    } else {
-                        ProtocolVersion::RESP2
-                    }
-                }
-                _ => ProtocolVersion::RESP2,
-            },
+            protocol: parse_protocol(&query)?,
         },
     })
 }
@@ -409,16 +421,7 @@ fn url_to_unix_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
             },
             username: query.get("user").map(|username| username.to_string()),
             password: query.get("pass").map(|password| password.to_string()),
-            protocol: match query.get("resp3") {
-                Some(v) => {
-                    if v == "true" {
-                        ProtocolVersion::RESP3
-                    } else {
-                        ProtocolVersion::RESP2
-                    }
-                }
-                _ => ProtocolVersion::RESP2,
-            },
+            protocol: parse_protocol(&query)?,
         },
     })
 }
@@ -540,9 +543,8 @@ pub struct Connection {
     // Field indicating which protocol to use for server communications.
     protocol: ProtocolVersion,
 
-    /// `PushManager` instance for the connection.
     /// This is used to manage Push messages in RESP3 mode.
-    push_manager: PushManager,
+    push_sender: Option<SyncPushSender>,
 }
 
 /// Represents a pubsub connection.
@@ -995,7 +997,7 @@ fn setup_connection(
         db: connection_info.db,
         pubsub: false,
         protocol: connection_info.protocol,
-        push_manager: PushManager::new(),
+        push_sender: None,
     };
 
     if connection_info.protocol != ProtocolVersion::RESP2 {
@@ -1211,32 +1213,54 @@ impl Connection {
         Ok(())
     }
 
+    fn send_push(&self, push: PushInfo) {
+        if let Some(sender) = &self.push_sender {
+            let _ = sender.send(push);
+        }
+    }
+
+    fn try_send(&self, value: &RedisResult<Value>) {
+        if let Ok(Value::Push { kind, data }) = value {
+            self.send_push(PushInfo {
+                kind: kind.clone(),
+                data: data.clone(),
+            });
+        }
+    }
+
+    fn send_disconnect(&self) {
+        self.send_push(PushInfo {
+            kind: PushKind::Disconnection,
+            data: vec![],
+        })
+    }
+
     /// Fetches a single response from the connection.
     fn read_response(&mut self) -> RedisResult<Value> {
         let result = match self.con {
             ActualConnection::Tcp(TcpConnection { ref mut reader, .. }) => {
                 let result = self.parser.parse_value(reader);
-                self.push_manager.try_send(&result);
+                self.try_send(&result);
                 result
             }
             #[cfg(all(feature = "tls-native-tls", not(feature = "tls-rustls")))]
             ActualConnection::TcpNativeTls(ref mut boxed_tls_connection) => {
                 let reader = &mut boxed_tls_connection.reader;
                 let result = self.parser.parse_value(reader);
-                self.push_manager.try_send(&result);
+                self.try_send(&result);
                 result
             }
             #[cfg(feature = "tls-rustls")]
             ActualConnection::TcpRustls(ref mut boxed_tls_connection) => {
                 let reader = &mut boxed_tls_connection.reader;
                 let result = self.parser.parse_value(reader);
-                self.push_manager.try_send(&result);
+                self.try_send(&result);
                 result
             }
             #[cfg(unix)]
             ActualConnection::Unix(UnixConnection { ref mut sock, .. }) => {
                 let result = self.parser.parse_value(sock);
-                self.push_manager.try_send(&result);
+                self.try_send(&result);
                 result
             }
         };
@@ -1248,7 +1272,7 @@ impl Connection {
             };
             if shutdown {
                 // Notify the PushManager that the connection was lost
-                self.push_manager.try_send_disconnect();
+                self.send_disconnect();
                 match self.con {
                     ActualConnection::Tcp(ref mut connection) => {
                         let _ = connection.reader.shutdown(net::Shutdown::Both);
@@ -1275,9 +1299,9 @@ impl Connection {
         result
     }
 
-    /// Returns `PushManager` of Connection, this method is used to subscribe/unsubscribe from Push types
-    pub fn get_push_manager(&self) -> PushManager {
-        self.push_manager.clone()
+    /// Sets sender channel for push values.
+    pub fn set_push_sender(&mut self, sender: SyncPushSender) {
+        self.push_sender = Some(sender);
     }
 
     fn send_bytes(&mut self, bytes: &[u8]) -> RedisResult<Value> {
@@ -1285,8 +1309,7 @@ impl Connection {
         if self.protocol != ProtocolVersion::RESP2 {
             if let Err(e) = &result {
                 if e.is_connection_dropped() {
-                    // Notify the PushManager that the connection was lost
-                    self.push_manager.try_send_disconnect();
+                    self.send_disconnect();
                 }
             }
         }
@@ -1811,6 +1834,23 @@ mod tests {
                     },
                 },
             ),
+            (
+                url::Url::parse("redis://127.0.0.1/?protocol=2").unwrap(),
+                ConnectionInfo {
+                    addr: ConnectionAddr::Tcp("127.0.0.1".to_string(), 6379),
+                    redis: Default::default(),
+                },
+            ),
+            (
+                url::Url::parse("redis://127.0.0.1/?protocol=resp3").unwrap(),
+                ConnectionInfo {
+                    addr: ConnectionAddr::Tcp("127.0.0.1".to_string(), 6379),
+                    redis: RedisConnectionInfo {
+                        protocol: ProtocolVersion::RESP3,
+                        ..Default::default()
+                    },
+                },
+            ),
         ];
         for (url, expected) in cases.into_iter() {
             let res = url_to_tcp_connection_info(url.clone()).unwrap();
@@ -1833,21 +1873,33 @@ mod tests {
     #[test]
     fn test_url_to_tcp_connection_info_failed() {
         let cases = vec![
-            (url::Url::parse("redis://").unwrap(), "Missing hostname"),
+            (
+                url::Url::parse("redis://").unwrap(),
+                "Missing hostname",
+                None,
+            ),
             (
                 url::Url::parse("redis://127.0.0.1/db").unwrap(),
                 "Invalid database number",
+                None,
             ),
             (
                 url::Url::parse("redis://C3%B0@127.0.0.1").unwrap(),
                 "Username is not valid UTF-8 string",
+                None,
             ),
             (
                 url::Url::parse("redis://:C3%B0@127.0.0.1").unwrap(),
                 "Password is not valid UTF-8 string",
+                None,
+            ),
+            (
+                url::Url::parse("redis://127.0.0.1/?protocol=4").unwrap(),
+                "Invalid protocol version",
+                Some("4"),
             ),
         ];
-        for (url, expected) in cases.into_iter() {
+        for (url, expected, detail) in cases.into_iter() {
             let res = url_to_tcp_connection_info(url).unwrap_err();
             assert_eq!(
                 res.kind(),
@@ -1858,7 +1910,7 @@ mod tests {
             #[allow(deprecated)]
             let desc = std::error::Error::description(&res);
             assert_eq!(desc, expected, "{}", &res);
-            assert_eq!(res.detail(), None, "{}", &res);
+            assert_eq!(res.detail(), detail, "{}", &res);
         }
     }
 
@@ -1914,6 +1966,16 @@ mod tests {
                         db: 2,
                         username: Some("%johndoe%".to_string()),
                         password: Some("&?= *+".to_string()),
+                        ..Default::default()
+                    },
+                },
+            ),
+            (
+                url::Url::parse("redis+unix:///var/run/redis.sock?protocol=3").unwrap(),
+                ConnectionInfo {
+                    addr: ConnectionAddr::Unix("/var/run/redis.sock".into()),
+                    redis: RedisConnectionInfo {
+                        protocol: ProtocolVersion::RESP3,
                         ..Default::default()
                     },
                 },

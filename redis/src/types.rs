@@ -1,20 +1,19 @@
+#[cfg(feature = "ahash")]
+pub(crate) use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use num_bigint::BigInt;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(not(feature = "ahash"))]
+pub(crate) use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::error;
 use std::ffi::{CString, NulError};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::io;
+use std::ops::Deref;
 use std::str::{from_utf8, Utf8Error};
 use std::string::FromUtf8Error;
-
-#[cfg(feature = "ahash")]
-pub(crate) use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use num_bigint::BigInt;
-#[cfg(not(feature = "ahash"))]
-pub(crate) use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
 
 macro_rules! invalid_type_error {
     ($v:expr, $det:expr) => {{
@@ -2522,3 +2521,47 @@ pub enum ProtocolVersion {
     /// <https://github.com/redis/redis-specifications/blob/master/protocol/RESP3.md>
     RESP3,
 }
+
+/// Helper enum that is used to define option for the hash expire commands
+#[derive(Clone, Copy)]
+pub enum ExpireOption {
+    /// NONE -- Set expiration regardless of the field's current expiration.
+    NONE,
+    /// NX -- Only set expiration only when the field has no expiration.
+    NX,
+    /// XX -- Only set expiration only when the field has an existing expiration.
+    XX,
+    /// GT -- Only set expiration only when the new expiration is greater than current one.
+    GT,
+    /// LT -- Only set expiration only when the new expiration is less than current one.
+    LT,
+}
+
+impl ToRedisArgs for ExpireOption {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        match self {
+            ExpireOption::NX => out.write_arg(b"NX"),
+            ExpireOption::XX => out.write_arg(b"XX"),
+            ExpireOption::GT => out.write_arg(b"GT"),
+            ExpireOption::LT => out.write_arg(b"LT"),
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+/// A push message from the server.
+pub struct PushInfo {
+    /// Push Kind
+    pub kind: PushKind,
+    /// Data from push message
+    pub data: Vec<Value>,
+}
+
+#[cfg(feature = "aio")]
+pub(crate) type AsyncPushSender = tokio::sync::mpsc::UnboundedSender<PushInfo>;
+
+pub(crate) type SyncPushSender = std::sync::mpsc::Sender<PushInfo>;

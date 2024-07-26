@@ -4,17 +4,18 @@ mod support;
 
 #[cfg(test)]
 mod basic {
+    use assert_approx_eq::assert_approx_eq;
     use redis::{cmd, ProtocolVersion, PushInfo, RedisConnectionInfo, ScanOptions};
     use redis::{
-        Commands, ConnectionInfo, ConnectionLike, ControlFlow, ErrorKind, ExistenceCheck, Expiry,
-        PubSubCommands, PushKind, RedisResult, SetExpiry, SetOptions, ToRedisArgs, Value,
+        Commands, ConnectionInfo, ConnectionLike, ControlFlow, ErrorKind, ExistenceCheck,
+        ExpireOption, Expiry, PubSubCommands, PushKind, RedisResult, SetExpiry, SetOptions,
+        ToRedisArgs, Value,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::collections::{HashMap, HashSet};
     use std::thread::{sleep, spawn};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use std::vec;
-    use tokio::sync::mpsc::error::TryRecvError;
 
     use crate::{assert_args, support::*};
 
@@ -302,6 +303,92 @@ mod basic {
         assert_eq!(h.len(), 2);
         assert_eq!(h.get("key_1"), Some(&1i32));
         assert_eq!(h.get("key_2"), Some(&2i32));
+    }
+
+    #[test]
+    fn test_hash_expiration() {
+        let ctx = TestContext::new();
+        // Hash expiration is only supported in Redis 7.4.0 and later.
+        if ctx.get_version() < (7, 4, 0) {
+            return;
+        }
+        let mut con = ctx.connection();
+        redis::cmd("HMSET")
+            .arg("foo")
+            .arg("f0")
+            .arg("v0")
+            .arg("f1")
+            .arg("v1")
+            .exec(&mut con)
+            .unwrap();
+
+        let result: Vec<i32> = con
+            .hexpire("foo", 10, ExpireOption::NONE, &["f0", "f1"])
+            .unwrap();
+        assert_eq!(result, vec![1, 1]);
+
+        let ttls: Vec<i64> = con.httl("foo", &["f0", "f1"]).unwrap();
+        assert_eq!(ttls.len(), 2);
+        assert_approx_eq!(ttls[0], 10, 3);
+        assert_approx_eq!(ttls[1], 10, 3);
+
+        let ttls: Vec<i64> = con.hpttl("foo", &["f0", "f1"]).unwrap();
+        assert_eq!(ttls.len(), 2);
+        assert_approx_eq!(ttls[0], 10000, 3000);
+        assert_approx_eq!(ttls[1], 10000, 3000);
+
+        let result: Vec<i32> = con
+            .hexpire("foo", 10, ExpireOption::NX, &["f0", "f1"])
+            .unwrap();
+        // should return 0 because the keys already have an expiration time
+        assert_eq!(result, vec![0, 0]);
+
+        let result: Vec<i32> = con
+            .hexpire("foo", 10, ExpireOption::XX, &["f0", "f1"])
+            .unwrap();
+        // should return 1 because the keys already have an expiration time
+        assert_eq!(result, vec![1, 1]);
+
+        let result: Vec<i32> = con
+            .hpexpire("foo", 1000, ExpireOption::GT, &["f0", "f1"])
+            .unwrap();
+        // should return 0 because the keys already have an expiration time greater than 1000
+        assert_eq!(result, vec![0, 0]);
+
+        let result: Vec<i32> = con
+            .hpexpire("foo", 1000, ExpireOption::LT, &["f0", "f1"])
+            .unwrap();
+        // should return 1 because the keys already have an expiration time less than 1000
+        assert_eq!(result, vec![1, 1]);
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let result: Vec<i32> = con
+            .hexpire_at(
+                "foo",
+                (now_secs + 10) as i64,
+                ExpireOption::GT,
+                &["f0", "f1"],
+            )
+            .unwrap();
+        assert_eq!(result, vec![1, 1]);
+
+        let result: Vec<u64> = con.hexpire_time("foo", &["f0", "f1"]).unwrap();
+        assert_eq!(result, vec![now_secs + 10, now_secs + 10]);
+        let result: Vec<u64> = con.hpexpire_time("foo", &["f0", "f1"]).unwrap();
+        assert_eq!(
+            result,
+            vec![now_secs * 1000 + 10_000, now_secs * 1000 + 10_000]
+        );
+
+        let result: Vec<bool> = con.hpersist("foo", &["f0", "f1"]).unwrap();
+        assert_eq!(result, vec![true, true]);
+        let ttls: Vec<i64> = con.hpttl("foo", &["f0", "f1"]).unwrap();
+        assert_eq!(ttls, vec![-1, -1]);
+
+        assert_eq!(con.unlink(&["foo"]), Ok(1));
     }
 
     // Requires redis-server >= 4.0.0.
@@ -723,9 +810,9 @@ mod basic {
 
         // Connection for subscriber api
         let mut pubsub_con = ctx.connection();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         // Only useful when RESP3 is enabled
-        pubsub_con.get_push_manager().replace_sender(tx);
+        pubsub_con.set_push_sender(tx);
 
         // Barrier is used to make test thread wait to publish
         // until after the pubsub thread has subscribed.
@@ -798,9 +885,9 @@ mod basic {
         let ctx = TestContext::new();
         let mut con = ctx.connection();
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         // Only useful when RESP3 is enabled
-        con.get_push_manager().replace_sender(tx);
+        con.set_push_sender(tx);
         {
             let mut pubsub = con.as_pubsub();
             pubsub.subscribe("foo").unwrap();
@@ -1060,7 +1147,7 @@ mod basic {
         assert_eq!(con.mset(&[("key1", 1), ("key2", 2)]), Ok(()));
         assert_eq!(con.get(&["key1", "key2"]), Ok((1, 2)));
         assert_eq!(con.get(vec!["key1", "key2"]), Ok((1, 2)));
-        assert_eq!(con.get(&vec!["key1", "key2"]), Ok((1, 2)));
+        assert_eq!(con.get(vec!["key1", "key2"]), Ok((1, 2)));
     }
 
     #[test]
@@ -1649,8 +1736,8 @@ mod basic {
         let client = redis::Client::open(connection_info).unwrap();
 
         let mut con = client.get_connection().unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        con.get_push_manager().replace_sender(tx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        con.set_push_sender(tx);
         let _ = cmd("CLIENT")
             .arg("TRACKING")
             .arg("ON")
@@ -1671,8 +1758,8 @@ mod basic {
                 (kind, data)
             );
         }
-        let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
-        con.get_push_manager().replace_sender(new_tx.clone());
+        let (new_tx, new_rx) = std::sync::mpsc::channel();
+        con.set_push_sender(new_tx.clone());
         drop(rx);
         let _: RedisResult<()> = pipe.query(&mut con);
         let _: i32 = con.get("key_1").unwrap();
@@ -1705,11 +1792,14 @@ mod basic {
         let client = redis::Client::open(connection_info).unwrap();
 
         let mut con = client.get_connection().unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        con.get_push_manager().replace_sender(tx.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        con.set_push_sender(tx.clone());
 
         let _: () = con.set("A", "1").unwrap();
-        assert_eq!(rx.try_recv().unwrap_err(), TryRecvError::Empty);
+        assert_eq!(
+            rx.try_recv().unwrap_err(),
+            std::sync::mpsc::TryRecvError::Empty
+        );
         drop(ctx);
         let x: RedisResult<()> = con.set("A", "1");
         assert!(x.is_err());
@@ -1725,9 +1815,9 @@ mod basic {
         }
         let mut con = ctx.connection();
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut pubsub_con = ctx.connection();
-        pubsub_con.get_push_manager().replace_sender(tx);
+        pubsub_con.set_push_sender(tx);
 
         {
             // `set_no_response` is used because in RESP3

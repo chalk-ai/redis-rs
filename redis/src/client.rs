@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+#[cfg(feature = "aio")]
+use crate::types::AsyncPushSender;
 use crate::{
     connection::{connect, Connection, ConnectionInfo, ConnectionLike, IntoConnectionInfo},
     types::{RedisResult, Value},
@@ -67,20 +69,21 @@ impl Client {
 }
 
 /// Options for creation of async connection
+#[cfg(feature = "aio")]
+#[derive(Clone, Default)]
 pub struct AsyncConnectionConfig {
     /// Maximum time to wait for a response from the server
-    response_timeout: Option<std::time::Duration>,
+    pub(crate) response_timeout: Option<std::time::Duration>,
     /// Maximum time to wait for a connection to be established
-    connection_timeout: Option<std::time::Duration>,
+    pub(crate) connection_timeout: Option<std::time::Duration>,
+    pub(crate) push_sender: Option<AsyncPushSender>,
 }
 
+#[cfg(feature = "aio")]
 impl AsyncConnectionConfig {
     /// Creates a new instance of the options with nothing set
     pub fn new() -> Self {
-        Self {
-            response_timeout: None,
-            connection_timeout: None,
-        }
+        Self::default()
     }
 
     /// Sets the connection timeout
@@ -94,11 +97,11 @@ impl AsyncConnectionConfig {
         self.response_timeout = Some(response_timeout);
         self
     }
-}
 
-impl Default for AsyncConnectionConfig {
-    fn default() -> Self {
-        Self::new()
+    /// Sets sender channel for push values. Will fail client creation if the connection isn't configured for RESP3 communications.
+    pub fn set_push_sender(mut self, sender: AsyncPushSender) -> Self {
+        self.push_sender = Some(sender);
+        self
     }
 }
 
@@ -212,15 +215,13 @@ impl Client {
                     rt.timeout(
                         connection_timeout,
                         self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
-                            config.response_timeout,
+                            config,
                         ),
                     )
                     .await
                 } else {
                     Ok(self
-                        .get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
-                            config.response_timeout,
-                        )
+                        .get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(config)
                         .await)
                 }
             }
@@ -230,14 +231,14 @@ impl Client {
                     rt.timeout(
                         connection_timeout,
                         self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
-                            config.response_timeout,
+                            config,
                         ),
                     )
                     .await
                 } else {
                     Ok(self
                         .get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
-                            config.response_timeout,
+                            config,
                         )
                         .await)
                 }
@@ -265,9 +266,9 @@ impl Client {
         let result = Runtime::locate()
             .timeout(
                 connection_timeout,
-                self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(Some(
-                    response_timeout,
-                )),
+                self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+                    &AsyncConnectionConfig::new().set_response_timeout(response_timeout),
+                ),
             )
             .await;
 
@@ -287,8 +288,10 @@ impl Client {
     pub async fn get_multiplexed_tokio_connection(
         &self,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
-        self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(None)
-            .await
+        self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+            &AsyncConnectionConfig::new(),
+        )
+        .await
     }
 
     /// Returns an async multiplexed connection from the client.
@@ -306,7 +309,7 @@ impl Client {
             .timeout(
                 connection_timeout,
                 self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
-                    Some(response_timeout),
+                    &AsyncConnectionConfig::new().set_response_timeout(response_timeout),
                 ),
             )
             .await;
@@ -327,8 +330,10 @@ impl Client {
     pub async fn get_multiplexed_async_std_connection(
         &self,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
-        self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(None)
-            .await
+        self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+            &AsyncConnectionConfig::new(),
+        )
+        .await
     }
 
     /// Returns an async multiplexed connection from the client and a future which must be polled
@@ -346,9 +351,9 @@ impl Client {
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
     )> {
-        self.create_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(Some(
-            response_timeout,
-        ))
+        self.create_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+            &AsyncConnectionConfig::new().set_response_timeout(response_timeout),
+        )
         .await
     }
 
@@ -365,8 +370,10 @@ impl Client {
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
     )> {
-        self.create_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(None)
-            .await
+        self.create_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
+            &AsyncConnectionConfig::new(),
+        )
+        .await
     }
 
     /// Returns an async multiplexed connection from the client and a future which must be polled
@@ -384,9 +391,9 @@ impl Client {
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
     )> {
-        self.create_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(Some(
-            response_timeout,
-        ))
+        self.create_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+            &AsyncConnectionConfig::new().set_response_timeout(response_timeout),
+        )
         .await
     }
 
@@ -403,8 +410,10 @@ impl Client {
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
     )> {
-        self.create_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(None)
-            .await
+        self.create_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
+            &AsyncConnectionConfig::new(),
+        )
+        .await
     }
 
     /// Returns an async [`ConnectionManager`][connection-manager] from the client.
@@ -630,13 +639,13 @@ impl Client {
 
     async fn get_multiplexed_async_connection_inner<T>(
         &self,
-        response_timeout: Option<std::time::Duration>,
+        config: &AsyncConnectionConfig,
     ) -> RedisResult<crate::aio::MultiplexedConnection>
     where
         T: crate::aio::RedisRuntime,
     {
         let (connection, driver) = self
-            .create_multiplexed_async_connection_inner::<T>(response_timeout)
+            .create_multiplexed_async_connection_inner::<T>(config)
             .await?;
         T::spawn(driver);
         Ok(connection)
@@ -644,7 +653,7 @@ impl Client {
 
     async fn create_multiplexed_async_connection_inner<T>(
         &self,
-        response_timeout: Option<std::time::Duration>,
+        config: &AsyncConnectionConfig,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -653,10 +662,10 @@ impl Client {
         T: crate::aio::RedisRuntime,
     {
         let con = self.get_simple_async_connection::<T>().await?;
-        crate::aio::MultiplexedConnection::new_with_response_timeout(
+        crate::aio::MultiplexedConnection::new_with_config(
             &self.connection_info,
             con,
-            response_timeout,
+            config.clone(),
         )
         .await
     }
@@ -681,10 +690,10 @@ impl Client {
     ///
     /// - `conn_info` - URL using the `rediss://` scheme.
     /// - `tls_certs` - `TlsCertificates` structure containing:
-    /// -- `client_tls` - Optional `ClientTlsConfig` containing byte streams for
-    /// --- `client_cert` - client's byte stream containing client certificate in PEM format
-    /// --- `client_key` - client's byte stream containing private key in PEM format
-    /// -- `root_cert` - Optional byte stream yielding PEM formatted file for root certificates.
+    ///     - `client_tls` - Optional `ClientTlsConfig` containing byte streams for
+    ///         - `client_cert` - client's byte stream containing client certificate in PEM format
+    ///         - `client_key` - client's byte stream containing private key in PEM format
+    ///     - `root_cert` - Optional byte stream yielding PEM formatted file for root certificates.
     ///
     /// If `ClientTlsConfig` ( cert+key pair ) is not provided, then client-side authentication is not enabled.
     /// If `root_cert` is not provided, then system root certificates are used instead.

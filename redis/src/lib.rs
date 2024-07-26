@@ -79,16 +79,16 @@
 //! * URL objects from the redis-url crate.
 //! * `ConnectionInfo` objects.
 //!
-//! The URL format is `redis://[<username>][:<password>@]<hostname>[:port][/<db>]`
+//! The URL format is `redis://[<username>][:<password>@]<hostname>[:port][/[<db>][?protocol=<protocol>]]`
 //!
 //! If Unix socket support is available you can use a unix URL in this format:
 //!
-//! `redis+unix:///<path>[?db=<db>[&pass=<password>][&user=<username>]]`
+//! `redis+unix:///<path>[?db=<db>[&pass=<password>][&user=<username>][&protocol=<protocol>]]`
 //!
 //! For compatibility with some other redis libraries, the "unix" scheme
 //! is also supported:
 //!
-//! `unix:///<path>[?db=<db>][&pass=<password>][&user=<username>]]`
+//! `unix:///<path>[?db=<db>][&pass=<password>][&user=<username>][&protocol=<protocol>]]`
 //!
 //! ## Executing Low-Level Commands
 //!
@@ -171,6 +171,12 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # RESP3 support
+//! Since Redis / Valkey version 6, a newer communication protocol called RESP3 is supported.
+//! Using this protocol allows the user both to receive a more varied `Value` results, for users
+//! who use the low-level `Value` type, and to receive out of band messages on the same connection. This allows the user to receive PubSub
+//! messages on the same connection, instead of creating a new PubSub connection (see "RESP3 async pubsub").
 //!
 //! # Iteration Protocol
 //!
@@ -295,6 +301,31 @@
 //!     let payload : String = msg.get_payload()?;
 //!     println!("channel '{}': {}", msg.get_channel_name(), payload);
 //! }
+//! # }
+//! ```
+//!
+//! ## RESP3 async pubsub
+//! If you're targeting a Redis/Valkey server of version 6 or above, you can receive
+//! pubsub messages from it without creating another connection, by setting a push sender on the connection.
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "aio")]
+//! # {
+//! # use futures::prelude::*;
+//! # use redis::AsyncCommands;
+//!
+//! # async fn func() -> redis::RedisResult<()> {
+//! let client = redis::Client::open("redis://127.0.0.1/?protocol=resp3").unwrap();
+//! let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+//! let config = redis::AsyncConnectionConfig::new().set_push_sender(tx);
+//! let mut con = client.get_multiplexed_async_connection_with_config(&config).await?;
+//! con.subscribe("channel_1").await?;
+//! con.subscribe("channel_2").await?;
+//!
+//! loop {
+//!   println!("Received {:?}", rx.recv().await.unwrap());
+//! }
+//! # Ok(()) }
 //! # }
 //! ```
 //!
@@ -441,6 +472,7 @@ let primary = sentinel.get_async_connection().await.unwrap();
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 // public api
+#[cfg(feature = "aio")]
 pub use crate::client::AsyncConnectionConfig;
 pub use crate::client::Client;
 pub use crate::cmd::{cmd, pack_command, pipe, Arg, Cmd, Iter};
@@ -453,7 +485,6 @@ pub use crate::connection::{
 };
 pub use crate::parser::{parse_redis_value, Parser};
 pub use crate::pipeline::Pipeline;
-pub use push_manager::{PushInfo, PushManager};
 
 #[cfg(feature = "script")]
 #[cfg_attr(docsrs, doc(cfg(feature = "script")))]
@@ -478,6 +509,7 @@ pub use crate::types::{
     Expiry,
     SetExpiry,
     ExistenceCheck,
+    ExpireOption,
 
     // error and result types
     RedisError,
@@ -489,7 +521,8 @@ pub use crate::types::{
     Value,
     PushKind,
     VerbatimFormat,
-    ProtocolVersion
+    ProtocolVersion,
+    PushInfo
 };
 
 #[cfg(feature = "aio")]
@@ -569,6 +602,5 @@ mod cmd;
 mod commands;
 mod connection;
 mod parser;
-mod push_manager;
 mod script;
 mod types;

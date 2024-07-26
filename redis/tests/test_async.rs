@@ -9,7 +9,7 @@ mod basic_async {
     use redis::aio::ConnectionManager;
     use redis::{
         aio::{ConnectionLike, MultiplexedConnection},
-        cmd, pipe, AsyncCommands, ConnectionInfo, ErrorKind, ProtocolVersion, PushInfo, PushKind,
+        cmd, pipe, AsyncCommands, ConnectionInfo, ErrorKind, ProtocolVersion, PushKind,
         RedisConnectionInfo, RedisError, RedisFuture, RedisResult, ScanOptions, ToRedisArgs, Value,
     };
     use tokio::{sync::mpsc::error::TryRecvError, time::timeout};
@@ -803,11 +803,13 @@ mod basic_async {
             let client = redis::Client::open(connection_info).unwrap();
 
             block_on_all(async move {
-                let mut conn = client.get_multiplexed_async_connection().await?;
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let config = redis::AsyncConnectionConfig::new().set_push_sender(tx);
+                let mut conn = client
+                    .get_multiplexed_async_connection_with_config(&config)
+                    .await?;
                 let pub_count = 10;
                 let channel_name = "phonewave".to_string();
-                conn.get_push_manager().replace_sender(tx.clone());
                 conn.subscribe(channel_name.clone()).await?;
                 let push = rx.recv().await.unwrap();
                 assert_eq!(push.kind, PushKind::Subscribe);
@@ -879,7 +881,7 @@ mod basic_async {
         }
 
         #[test]
-        fn push_manager_disconnection() {
+        fn push_sender_send_on_disconnect() {
             use redis::RedisError;
 
             let ctx = TestContext::new();
@@ -888,9 +890,11 @@ mod basic_async {
             let client = redis::Client::open(connection_info).unwrap();
 
             block_on_all(async move {
-                let mut conn = client.get_multiplexed_async_connection().await?;
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                conn.get_push_manager().replace_sender(tx.clone());
+                let config = redis::AsyncConnectionConfig::new().set_push_sender(tx);
+                let mut conn = client
+                    .get_multiplexed_async_connection_with_config(&config)
+                    .await?;
 
                 let _: () = conn.set("A", "1").await?;
                 assert_eq!(rx.try_recv().unwrap_err(), TryRecvError::Empty);
@@ -943,7 +947,7 @@ mod basic_async {
 
         let max_delay_between_attempts = 50;
 
-        let config = redis::aio::ConnectionManagerConfig::new()
+        let mut config = redis::aio::ConnectionManagerConfig::new()
             .set_factor(10000)
             .set_max_delay(max_delay_between_attempts);
 
@@ -955,13 +959,14 @@ mod basic_async {
 
         let ctx = TestContext::with_tls(tls_files.clone(), false);
         block_on_all(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            if ctx.protocol != ProtocolVersion::RESP2 {
+                config = config.set_push_sender(tx);
+            }
             let mut manager =
                 redis::aio::ConnectionManager::new_with_config(ctx.client.clone(), config)
                     .await
                     .unwrap();
-
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            manager.get_push_manager().replace_sender(tx.clone());
             kill_client_async(&mut manager, &ctx.client).await.unwrap();
 
             let result: RedisResult<redis::Value> = manager.set("foo", "bar").await;
@@ -973,7 +978,9 @@ mod basic_async {
 
             let result: redis::Value = manager.set("foo", "bar").await.unwrap();
             assert_eq!(result, redis::Value::Okay);
-            assert_eq!(rx.recv().await.unwrap().kind, PushKind::Disconnection);
+            if ctx.protocol != ProtocolVersion::RESP2 {
+                assert!(rx.try_recv().is_err());
+            }
             Ok(())
         })
         .unwrap();
@@ -1044,16 +1051,18 @@ mod basic_async {
 
     #[test]
     #[cfg(feature = "connection-manager")]
-    fn test_push_manager_cm() {
+    fn test_resp3_pushes_connection_manager() {
         let ctx = TestContext::new();
         let mut connection_info = ctx.server.connection_info();
         connection_info.redis.protocol = ProtocolVersion::RESP3;
         let client = redis::Client::open(connection_info).unwrap();
 
         block_on_all(async move {
-            let mut manager = redis::aio::ConnectionManager::new(client).await.unwrap();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            manager.get_push_manager().replace_sender(tx.clone());
+            let config = redis::aio::ConnectionManagerConfig::new().set_push_sender(tx);
+            let mut manager = redis::aio::ConnectionManager::new_with_config(client, config)
+                .await
+                .unwrap();
             manager
                 .send_packed_command(cmd("CLIENT").arg("TRACKING").arg("ON"))
                 .await
@@ -1061,7 +1070,7 @@ mod basic_async {
             let pipe = build_simple_pipeline_for_invalidation();
             let _: RedisResult<()> = pipe.query_async(&mut manager).await;
             let _: i32 = manager.get("key_1").await.unwrap();
-            let PushInfo { kind, data } = rx.try_recv().unwrap();
+            let redis::PushInfo { kind, data } = rx.try_recv().unwrap();
             assert_eq!(
                 (
                     PushKind::Invalidate,
@@ -1071,22 +1080,7 @@ mod basic_async {
                 ),
                 (kind, data)
             );
-            let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
-            manager.get_push_manager().replace_sender(new_tx);
-            drop(rx);
-            let _: RedisResult<()> = pipe.query_async(&mut manager).await;
-            let _: i32 = manager.get("key_1").await.unwrap();
-            let PushInfo { kind, data } = new_rx.try_recv().unwrap();
-            assert_eq!(
-                (
-                    PushKind::Invalidate,
-                    vec![Value::Array(vec![Value::BulkString(
-                        "key_1".as_bytes().to_vec()
-                    )])]
-                ),
-                (kind, data)
-            );
-            assert_eq!(TryRecvError::Empty, new_rx.try_recv().err().unwrap());
+
             Ok(())
         })
         .unwrap();
