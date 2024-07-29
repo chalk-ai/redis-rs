@@ -27,8 +27,6 @@ fn is_illegal_cmd(cmd: &str) -> bool {
         "PFMERGE" | "PFCOUNT" | "PING" | "PUBLISH" |
         "RANDOMKEY" | "RENAME" | "RENAMENX" | "RPOPLPUSH" |
         "SAVE" | "SCAN" |
-        // All commands that start with "SCRIPT"
-        "SCRIPT" | "SCRIPT EXISTS" | "SCRIPT FLUSH" | "SCRIPT KILL" | "SCRIPT LOAD" |
         "SDIFF" | "SDIFFSTORE" |
         // All commands that start with "SENTINEL"
         "SENTINEL" | "SENTINEL GET MASTER ADDR BY NAME" | "SENTINEL MASTER" | "SENTINEL MASTERS" |
