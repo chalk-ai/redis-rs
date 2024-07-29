@@ -1,5 +1,7 @@
-Fork of the rust redis client. 
-Currently just contians minor changes re: EVALSHA commands in cluster pipelines
+Fork of the rust redis client.
+Primarily includes changes around running lua scripts / pipelines on a Redis cluster.
+The branches match that of the main redis-rs repo to make it easier to sync up changes.
+The branch `chalk-main` contains the code actively used by Chalk.
 
 ***
 
@@ -101,22 +103,23 @@ redis = { version = "0.26.0", features = ["async-std-rustls-comp"] }
 
 With `rustls`, you can add the following feature flags on top of other feature flags to enable additional features:
 
--   `tls-rustls-insecure`: Allow insecure TLS connections
--   `tls-rustls-webpki-roots`: Use `webpki-roots` (Mozilla's root certificates) instead of native root certificates
+- `tls-rustls-insecure`: Allow insecure TLS connections
+- `tls-rustls-webpki-roots`: Use `webpki-roots` (Mozilla's root certificates) instead of native root certificates
 
 then you should be able to connect to a redis instance using the `rediss://` URL scheme:
 
 ```rust
-let client = redis::Client::open("rediss://127.0.0.1/")?;
+let client = redis::Client::open("rediss://127.0.0.1/") ?;
 ```
 
 To enable insecure mode, append `#insecure` at the end of the URL:
 
 ```rust
-let client = redis::Client::open("rediss://127.0.0.1/#insecure")?;
+let client = redis::Client::open("rediss://127.0.0.1/#insecure") ?;
 ```
 
-**Deprecation Notice:** If you were using the `tls` or `async-std-tls-comp` features, please use the `tls-native-tls` or `async-std-native-tls-comp` features respectively.
+**Deprecation Notice:** If you were using the `tls` or `async-std-tls-comp` features, please use the `tls-native-tls`
+or `async-std-native-tls-comp` features respectively.
 
 ## Cluster Support
 
@@ -167,7 +170,8 @@ Support for the RedisJSON Module can be enabled by specifying "json" as a featur
 
 `redis = { version = "0.26.0", features = ["json"] }`
 
-Then you can simply import the `JsonCommands` trait which will add the `json` commands to all Redis Connections (not to be confused with just `Commands` which only adds the default commands)
+Then you can simply import the `JsonCommands` trait which will add the `json` commands to all Redis Connections (not to
+be confused with just `Commands` which only adds the default commands)
 
 ```rust
 use redis::Client;
@@ -198,9 +202,10 @@ you can use the `Json` wrapper from the
 To test `redis` you're going to need to be able to test with the Redis Modules, to do this
 you must set the following environment variable before running the test script
 
--   `REDIS_RS_REDIS_JSON_PATH` = The absolute path to the RedisJSON module (Either `librejson.so` for Linux or `librejson.dylib` for MacOS).
+- `REDIS_RS_REDIS_JSON_PATH` = The absolute path to the RedisJSON module (Either `librejson.so` for Linux
+  or `librejson.dylib` for MacOS).
 
--   Please refer to this [link](https://github.com/RedisJSON/RedisJSON) to access the RedisJSON module:
+- Please refer to this [link](https://github.com/RedisJSON/RedisJSON) to access the RedisJSON module:
 
 <!-- As support for modules are added later, it would be wise to update this list -->
 
@@ -219,11 +224,13 @@ To run benchmarks:
 
     $ make bench
 
-To build the docs (require nightly compiler, see [rust-lang/rust#43781](https://github.com/rust-lang/rust/issues/43781)):
+To build the docs (require nightly compiler,
+see [rust-lang/rust#43781](https://github.com/rust-lang/rust/issues/43781)):
 
     $ make docs
 
-We encourage you to run `clippy` prior to seeking a merge for your work. The lints can be quite strict. Running this on your own workstation can save you time, since Travis CI will fail any build that doesn't satisfy `clippy`:
+We encourage you to run `clippy` prior to seeking a merge for your work. The lints can be quite strict. Running this on
+your own workstation can save you time, since Travis CI will fail any build that doesn't satisfy `clippy`:
 
     $ cargo clippy --all-features --all --tests --examples -- -D clippy::all -D warnings
 
