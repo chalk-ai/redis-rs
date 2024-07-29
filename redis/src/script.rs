@@ -103,6 +103,13 @@ impl Script {
         .invoke_async(con)
         .await
     }
+
+    #[inline]
+    pub fn load_cmd(&self) -> Cmd {
+        let mut cmd = cmd("SCRIPT");
+        cmd.arg("LOAD").arg(self.code.as_bytes());
+        cmd
+    }
 }
 
 /// Represents a prepared script call.
