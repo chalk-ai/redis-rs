@@ -2,7 +2,6 @@
 pub(crate) use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use num_bigint::BigInt;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(feature = "ahash"))]
 pub(crate) use std::collections::{HashMap, HashSet};
 use std::default::Default;
@@ -67,6 +66,15 @@ pub enum ExistenceCheck {
     NX,
     /// XX -- Only set the key if it already exists.
     XX,
+}
+
+/// Helper enum that is used to define field existence checks
+#[derive(Clone, Copy)]
+pub enum FieldExistenceCheck {
+    /// FNX -- Only set the fields if all do not already exist.
+    FNX,
+    /// FXX -- Only set the fields if all already exist.
+    FXX,
 }
 
 /// Helper enum that is used in some situations to describe
@@ -135,6 +143,8 @@ pub enum ErrorKind {
     NotBusy,
     /// Used when a cluster connection cannot find a connection to a valid node.
     ClusterConnectionNotFound,
+    /// Attempted to unsubscribe on a connection that is not in subscribed mode.
+    NoSub,
 
     #[cfg(feature = "json")]
     /// Error Serializing a struct to JSON form
@@ -159,6 +169,7 @@ pub enum ServerErrorKind {
     MasterDown,
     ReadOnly,
     NotBusy,
+    NoSub,
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -197,6 +208,7 @@ impl ServerError {
                 ServerErrorKind::MasterDown => "MASTERDOWN",
                 ServerErrorKind::ReadOnly => "READONLY",
                 ServerErrorKind::NotBusy => "NOTBUSY",
+                ServerErrorKind::NoSub => "NOSUB",
             },
         }
     }
@@ -229,6 +241,7 @@ impl From<ServerError> for RedisError {
                     ServerErrorKind::MasterDown => ErrorKind::MasterDown,
                     ServerErrorKind::ReadOnly => ErrorKind::ReadOnly,
                     ServerErrorKind::NotBusy => ErrorKind::NotBusy,
+                    ServerErrorKind::NoSub => ErrorKind::NoSub,
                 };
                 match detail {
                     Some(detail) => RedisError::from((kind, desc, detail)),
@@ -576,9 +589,10 @@ impl fmt::Debug for Value {
     }
 }
 
-/// Represents a redis error.  For the most part you should be using
-/// the Error trait to interact with this rather than the actual
-/// struct.
+/// Represents a redis error.
+///
+/// For the most part you should be using the Error trait to interact with this
+/// rather than the actual struct.
 pub struct RedisError {
     repr: ErrorRepr,
 }
@@ -673,12 +687,25 @@ impl From<rustls::Error> for RedisError {
 }
 
 #[cfg(feature = "tls-rustls")]
-impl From<rustls_pki_types::InvalidDnsNameError> for RedisError {
-    fn from(err: rustls_pki_types::InvalidDnsNameError) -> RedisError {
+impl From<rustls::pki_types::InvalidDnsNameError> for RedisError {
+    fn from(err: rustls::pki_types::InvalidDnsNameError) -> RedisError {
         RedisError {
             repr: ErrorRepr::WithDescriptionAndDetail(
                 ErrorKind::IoError,
                 "TLS Error",
+                err.to_string(),
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "tls-rustls")]
+impl From<rustls_native_certs::Error> for RedisError {
+    fn from(err: rustls_native_certs::Error) -> RedisError {
+        RedisError {
+            repr: ErrorRepr::WithDescriptionAndDetail(
+                ErrorKind::IoError,
+                "Fetch certs Error",
                 err.to_string(),
             ),
         }
@@ -739,6 +766,13 @@ impl error::Error for RedisError {
             _ => None,
         }
     }
+
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self.repr {
+            ErrorRepr::IoError(ref err) => Some(err),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for RedisError {
@@ -772,13 +806,22 @@ impl fmt::Debug for RedisError {
     }
 }
 
-pub(crate) enum RetryMethod {
+/// What method should be used if retrying this request.
+#[non_exhaustive]
+pub enum RetryMethod {
+    /// Create a fresh connection, since the current connection is no longer usable.
     Reconnect,
+    /// Don't retry, this is a permanent error.
     NoRetry,
+    /// Retry immediately, this doesn't require a wait.
     RetryImmediately,
+    /// Retry after sleeping to avoid overloading the external service.
     WaitAndRetry,
+    /// The key has moved to a different node but we have to ask which node, this is only relevant for clusters.
     AskRedirect,
+    /// The key has moved to a different node, this is only relevant for clusters.
     MovedRedirect,
+    /// Reconnect the initial connection to the master cluster, this is only relevant for clusters.
     ReconnectFromInitialConnections,
 }
 
@@ -854,6 +897,9 @@ impl RedisError {
             ErrorKind::Serialize => "serializing",
             ErrorKind::RESP3NotSupported => "resp3 is not supported by server",
             ErrorKind::ParseError => "parse error",
+            ErrorKind::NoSub => {
+                "Server declined unsubscribe related command in non-subscribed mode"
+            }
         }
     }
 
@@ -989,7 +1035,13 @@ impl RedisError {
         Self { repr }
     }
 
-    pub(crate) fn retry_method(&self) -> RetryMethod {
+    /// Specifies what method (if any) should be used to retry this request.
+    ///
+    /// If you are using the cluster api retrying of requests is already handled by the library.
+    ///
+    /// This isn't precise, and internally the library uses multiple other considerations rather
+    /// than just the error kind on when to retry.
+    pub fn retry_method(&self) -> RetryMethod {
         match self.kind() {
             ErrorKind::Moved => RetryMethod::MovedRedirect,
             ErrorKind::Ask => RetryMethod::AskRedirect,
@@ -1015,6 +1067,7 @@ impl RedisError {
             #[cfg(feature = "json")]
             ErrorKind::Serialize => RetryMethod::NoRetry,
             ErrorKind::RESP3NotSupported => RetryMethod::NoRetry,
+            ErrorKind::NoSub => RetryMethod::NoRetry,
 
             ErrorKind::ParseError => RetryMethod::Reconnect,
             ErrorKind::AuthenticationFailed => RetryMethod::Reconnect,
@@ -1041,6 +1094,19 @@ impl RedisError {
     }
 }
 
+/// Creates a new Redis error with the `ExtensionError` kind.
+///
+/// This function is used to create Redis errors for extension error codes
+/// that are not directly understood by the library.
+///
+/// # Arguments
+///
+/// * `code` - The error code string returned by the Redis server
+/// * `detail` - Optional detailed error message. If None, a default message is used.
+///
+/// # Returns
+///
+/// A `RedisError` with the `ExtensionError` kind.
 pub fn make_extension_error(code: String, detail: Option<String>) -> RedisError {
     RedisError {
         repr: ErrorRepr::ExtensionError(
@@ -1141,6 +1207,157 @@ impl Deref for InfoDict {
     }
 }
 
+/// High level representation of response to the [`ROLE`][1] command.
+///
+/// [1]: https://redis.io/docs/latest/commands/role/
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Role {
+    /// Represents a primary role, which is `master` in legacy Redis terminology.
+    Primary {
+        /// The current primary replication offset
+        replication_offset: u64,
+        /// List of replica, each represented by a tuple of IP, port and the last acknowledged replication offset.
+        replicas: Vec<ReplicaInfo>,
+    },
+    /// Represents a replica role, which is `slave` in legacy Redis terminology.
+    Replica {
+        /// The IP of the primary.
+        primary_ip: String,
+        /// The port of the primary.
+        primary_port: u16,
+        /// The state of the replication from the point of view of the primary.
+        replication_state: String,
+        /// The amount of data received from the replica so far in terms of primary replication offset.
+        data_received: u64,
+    },
+    /// Represents a sentinel role.
+    Sentinel {
+        /// List of primary names monitored by this Sentinel instance.
+        primary_names: Vec<String>,
+    },
+}
+
+/// Replication information for a replica, as returned by the [`ROLE`][1] command.
+///
+/// [1]: https://redis.io/docs/latest/commands/role/
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplicaInfo {
+    /// The IP of the replica.
+    pub ip: String,
+    /// The port of the replica.
+    pub port: u16,
+    /// The last acknowledged replication offset.
+    pub replication_offset: i64,
+}
+
+impl FromRedisValue for ReplicaInfo {
+    fn from_redis_value(v: &Value) -> RedisResult<Self> {
+        Self::from_owned_redis_value(v.clone())
+    }
+
+    fn from_owned_redis_value(v: Value) -> RedisResult<Self> {
+        let v = match get_owned_inner_value(v).into_sequence() {
+            Ok(v) => v,
+            Err(v) => invalid_type_error!(v, "Replica response should be an array"),
+        };
+        if v.len() < 3 {
+            invalid_type_error!(v, "Replica array is too short, expected 3 elements")
+        }
+        let mut v = v.into_iter();
+        let ip = from_owned_redis_value(v.next().expect("len was checked"))?;
+        let port = from_owned_redis_value(v.next().expect("len was checked"))?;
+        let offset = from_owned_redis_value(v.next().expect("len was checked"))?;
+        Ok(ReplicaInfo {
+            ip,
+            port,
+            replication_offset: offset,
+        })
+    }
+}
+
+impl FromRedisValue for Role {
+    fn from_redis_value(v: &Value) -> RedisResult<Self> {
+        Self::from_owned_redis_value(v.clone())
+    }
+
+    fn from_owned_redis_value(v: Value) -> RedisResult<Self> {
+        let v = match get_owned_inner_value(v).into_sequence() {
+            Ok(v) => v,
+            Err(v) => invalid_type_error!(v, "Role response should be an array"),
+        };
+        if v.len() < 2 {
+            invalid_type_error!(v, "Role array is too short, expected at least 2 elements")
+        }
+        match &v[0] {
+            Value::BulkString(role) => match role.as_slice() {
+                b"master" => Role::new_primary(v),
+                b"slave" => Role::new_replica(v),
+                b"sentinel" => Role::new_sentinel(v),
+                _ => invalid_type_error!(v, "Role type is not master, slave or sentinel"),
+            },
+            _ => invalid_type_error!(v, "Role type is not a bulk string"),
+        }
+    }
+}
+
+impl Role {
+    fn new_primary(values: Vec<Value>) -> RedisResult<Self> {
+        if values.len() < 3 {
+            invalid_type_error!(
+                values,
+                "Role primary response too short, expected 3 elements"
+            )
+        }
+
+        let mut values = values.into_iter();
+        _ = values.next();
+
+        let replication_offset = from_owned_redis_value(values.next().expect("len was checked"))?;
+        let replicas = from_owned_redis_value(values.next().expect("len was checked"))?;
+
+        Ok(Role::Primary {
+            replication_offset,
+            replicas,
+        })
+    }
+
+    fn new_replica(values: Vec<Value>) -> RedisResult<Self> {
+        if values.len() < 5 {
+            invalid_type_error!(
+                values,
+                "Role replica response too short, expected 5 elements"
+            )
+        }
+
+        let mut values = values.into_iter();
+        _ = values.next();
+
+        let primary_ip = from_owned_redis_value(values.next().expect("len was checked"))?;
+        let primary_port = from_owned_redis_value(values.next().expect("len was checked"))?;
+        let replication_state = from_owned_redis_value(values.next().expect("len was checked"))?;
+        let data_received = from_owned_redis_value(values.next().expect("len was checked"))?;
+
+        Ok(Role::Replica {
+            primary_ip,
+            primary_port,
+            replication_state,
+            data_received,
+        })
+    }
+
+    fn new_sentinel(values: Vec<Value>) -> RedisResult<Self> {
+        if values.len() < 2 {
+            invalid_type_error!(
+                values,
+                "Role sentinel response too short, expected at least 2 elements"
+            )
+        }
+        let second_val = values.into_iter().nth(1).expect("len was checked");
+        let primary_names = from_owned_redis_value(second_val)?;
+        Ok(Role::Sentinel { primary_names })
+    }
+}
+
 /// Abstraction trait for redis command abstractions.
 pub trait RedisWrite {
     /// Accepts a serialized redis command.
@@ -1149,6 +1366,121 @@ pub trait RedisWrite {
     /// Accepts a serialized redis command.
     fn write_arg_fmt(&mut self, arg: impl fmt::Display) {
         self.write_arg(arg.to_string().as_bytes())
+    }
+
+    /// Appends an empty argument to the command, and returns a
+    /// [`std::io::Write`] instance that can write to it.
+    ///
+    /// Writing multiple arguments into this buffer is unsupported. The resulting
+    /// data will be interpreted as one argument by Redis.
+    ///
+    /// Writing no data is supported and is similar to having an empty bytestring
+    /// as an argument.
+    fn writer_for_next_arg(&mut self) -> impl std::io::Write + '_;
+
+    /// Reserve space for `additional` arguments in the command
+    ///
+    /// `additional` is a list of the byte sizes of the arguments.
+    ///
+    /// # Examples
+    /// Sending some Protobufs with `prost` to Redis.
+    /// ```rust,ignore
+    /// use prost::Message;
+    ///
+    /// let to_send: Vec<SomeType> = todo!();
+    /// let mut cmd = Cmd::new();
+    ///
+    /// // Calculate and reserve the space for the args
+    /// cmd.reserve_space_for_args(to_send.iter().map(Message::encoded_len));
+    ///
+    /// // Write the args to the buffer
+    /// for arg in to_send {
+    ///     // Encode the type directly into the Cmd buffer
+    ///     // Supplying the required capacity again is not needed for Cmd,
+    ///     // but can be useful for other implementers like Vec<Vec<u8>>.
+    ///     arg.encode(cmd.bufmut_for_next_arg(arg.encoded_len()));
+    /// }
+    ///
+    /// ```
+    ///
+    /// # Implementation note
+    /// The default implementation provided by this trait is a no-op. It's therefore strongly
+    /// recommended to implement this function. Depending on the internal buffer it might only
+    /// be possible to use the numbers of arguments (`additional.len()`) or the total expected
+    /// capacity (`additional.iter().sum()`). Implementors should assume that the caller will
+    /// be wrong and might over or under specify the amount of arguments and space required.
+    fn reserve_space_for_args(&mut self, additional: impl IntoIterator<Item = usize>) {
+        // _additional would show up in the documentation, so we assign it
+        // to make it used.
+        let _do_nothing = additional;
+    }
+
+    #[cfg(feature = "bytes")]
+    /// Appends an empty argument to the command, and returns a
+    /// [`bytes::BufMut`] instance that can write to it.
+    ///
+    /// `capacity` should be equal or greater to the amount of bytes
+    /// expected, as some implementations might not be able to resize
+    /// the returned buffer.
+    ///
+    /// Writing multiple arguments into this buffer is unsupported. The resulting
+    /// data will be interpreted as one argument by Redis.
+    ///
+    /// Writing no data is supported and is similar to having an empty bytestring
+    /// as an argument.
+    fn bufmut_for_next_arg(&mut self, capacity: usize) -> impl bytes::BufMut + '_ {
+        // This default implementation is not the most efficient, but does
+        // allow for implementers to skip this function. This means that
+        // upstream libraries that implement this trait don't suddenly
+        // stop working because someone enabled one of the async features.
+
+        /// Has a temporary buffer that is written to [`writer_for_next_arg`]
+        /// on drop.
+        struct Wrapper<'a> {
+            /// The buffer, implements [`bytes::BufMut`] allowing passthrough
+            buf: Vec<u8>,
+            /// The writer to the command, used on drop
+            writer: Box<dyn std::io::Write + 'a>,
+        }
+        unsafe impl bytes::BufMut for Wrapper<'_> {
+            fn remaining_mut(&self) -> usize {
+                self.buf.remaining_mut()
+            }
+
+            unsafe fn advance_mut(&mut self, cnt: usize) {
+                self.buf.advance_mut(cnt);
+            }
+
+            fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+                self.buf.chunk_mut()
+            }
+
+            // Vec specializes these methods, so we do too
+            fn put<T: bytes::buf::Buf>(&mut self, src: T)
+            where
+                Self: Sized,
+            {
+                self.buf.put(src);
+            }
+
+            fn put_slice(&mut self, src: &[u8]) {
+                self.buf.put_slice(src);
+            }
+
+            fn put_bytes(&mut self, val: u8, cnt: usize) {
+                self.buf.put_bytes(val, cnt);
+            }
+        }
+        impl Drop for Wrapper<'_> {
+            fn drop(&mut self) {
+                self.writer.write_all(&self.buf).unwrap()
+            }
+        }
+
+        Wrapper {
+            buf: Vec::with_capacity(capacity),
+            writer: Box::new(self.writer_for_next_arg()),
+        }
     }
 }
 
@@ -1159,6 +1491,25 @@ impl RedisWrite for Vec<Vec<u8>> {
 
     fn write_arg_fmt(&mut self, arg: impl fmt::Display) {
         self.push(arg.to_string().into_bytes())
+    }
+
+    fn writer_for_next_arg(&mut self) -> impl std::io::Write + '_ {
+        self.push(Vec::new());
+        self.last_mut().unwrap()
+    }
+
+    fn reserve_space_for_args(&mut self, additional: impl IntoIterator<Item = usize>) {
+        // It would be nice to do this, but there's no way to store where we currently are.
+        // Checking for the first empty Vec is not possible, as it's valid to write empty args.
+        // self.extend(additional.iter().copied().map(Vec::with_capacity));
+        // So we just reserve space for the extra args and have to forgo the extra optimisation
+        self.reserve(additional.into_iter().count());
+    }
+
+    #[cfg(feature = "bytes")]
+    fn bufmut_for_next_arg(&mut self, capacity: usize) -> impl bytes::BufMut + '_ {
+        self.push(Vec::with_capacity(capacity));
+        self.last_mut().unwrap()
     }
 }
 
@@ -1381,7 +1732,7 @@ impl ToRedisArgs for String {
     }
 }
 
-impl<'a> ToRedisArgs for &'a str {
+impl ToRedisArgs for &str {
     fn write_redis_args<W>(&self, out: &mut W)
     where
         W: ?Sized + RedisWrite,
@@ -1427,7 +1778,7 @@ impl<T: ToRedisArgs> ToRedisArgs for Vec<T> {
     }
 }
 
-impl<'a, T: ToRedisArgs> ToRedisArgs for &'a [T] {
+impl<T: ToRedisArgs> ToRedisArgs for &[T] {
     fn write_redis_args<W>(&self, out: &mut W)
     where
         W: ?Sized + RedisWrite,
@@ -1499,123 +1850,123 @@ macro_rules! deref_to_write_redis_args_impl {
 }
 
 deref_to_write_redis_args_impl! {
-    <'a, T: ?Sized> ToRedisArgs for &'a T where T: ToRedisArgs
+    <'a, T> ToRedisArgs for &'a T where T: ToRedisArgs
 }
 
 deref_to_write_redis_args_impl! {
-    <'a, T: ?Sized> ToRedisArgs for &'a mut T where T: ToRedisArgs
+    <'a, T> ToRedisArgs for &'a mut T where T: ToRedisArgs
 }
 
 deref_to_write_redis_args_impl! {
-    <T: ?Sized> ToRedisArgs for Box<T> where T: ToRedisArgs
+    <T> ToRedisArgs for Box<T> where T: ToRedisArgs
 }
 
 deref_to_write_redis_args_impl! {
-    <T: ?Sized> ToRedisArgs for std::sync::Arc<T> where T: ToRedisArgs
+    <T> ToRedisArgs for std::sync::Arc<T> where T: ToRedisArgs
 }
 
 deref_to_write_redis_args_impl! {
-    <T: ?Sized> ToRedisArgs for std::rc::Rc<T> where T: ToRedisArgs
+    <T> ToRedisArgs for std::rc::Rc<T> where T: ToRedisArgs
 }
 
 /// @note: Redis cannot store empty sets so the application has to
 /// check whether the set is empty and if so, not attempt to use that
 /// result
-impl<T: ToRedisArgs + Hash + Eq, S: BuildHasher + Default> ToRedisArgs
-    for std::collections::HashSet<T, S>
-{
-    fn write_redis_args<W>(&self, out: &mut W)
-    where
-        W: ?Sized + RedisWrite,
-    {
-        ToRedisArgs::make_arg_iter_ref(self.iter(), out)
-    }
+macro_rules! impl_to_redis_args_for_set {
+    (for <$($TypeParam:ident),+> $SetType:ty, where ($($WhereClause:tt)+) ) => {
+        impl< $($TypeParam),+ > ToRedisArgs for $SetType
+        where
+            $($WhereClause)+
+        {
+            fn write_redis_args<W>(&self, out: &mut W)
+            where
+                W: ?Sized + RedisWrite,
+            {
+                ToRedisArgs::make_arg_iter_ref(self.iter(), out)
+            }
 
-    fn num_of_args(&self) -> usize {
-        self.len()
-    }
+            fn num_of_args(&self) -> usize {
+                self.len()
+            }
+        }
+    };
 }
 
-/// @note: Redis cannot store empty sets so the application has to
-/// check whether the set is empty and if so, not attempt to use that
-/// result
+impl_to_redis_args_for_set!(
+    for <T, S> std::collections::HashSet<T, S>,
+    where (T: ToRedisArgs + Hash + Eq, S: BuildHasher + Default)
+);
+
+impl_to_redis_args_for_set!(
+    for <T> std::collections::BTreeSet<T>,
+    where (T: ToRedisArgs + Hash + Eq + Ord)
+);
+
+#[cfg(feature = "hashbrown")]
+impl_to_redis_args_for_set!(
+    for <T, S> hashbrown::HashSet<T, S>,
+    where (T: ToRedisArgs + Hash + Eq, S: BuildHasher + Default)
+);
+
 #[cfg(feature = "ahash")]
-impl<T: ToRedisArgs + Hash + Eq, S: BuildHasher + Default> ToRedisArgs for ahash::AHashSet<T, S> {
-    fn write_redis_args<W>(&self, out: &mut W)
-    where
-        W: ?Sized + RedisWrite,
-    {
-        ToRedisArgs::make_arg_iter_ref(self.iter(), out)
-    }
+impl_to_redis_args_for_set!(
+    for <T, S> ahash::AHashSet<T, S>,
+    where (T: ToRedisArgs + Hash + Eq, S: BuildHasher + Default)
+);
 
-    fn num_of_args(&self) -> usize {
-        self.len()
-    }
-}
-
-/// @note: Redis cannot store empty sets so the application has to
+/// @note: Redis cannot store empty maps so the application has to
 /// check whether the set is empty and if so, not attempt to use that
 /// result
-impl<T: ToRedisArgs + Hash + Eq + Ord> ToRedisArgs for BTreeSet<T> {
-    fn write_redis_args<W>(&self, out: &mut W)
-    where
-        W: ?Sized + RedisWrite,
-    {
-        ToRedisArgs::make_arg_iter_ref(self.iter(), out)
-    }
+macro_rules! impl_to_redis_args_for_map {
+    (
+        $(#[$meta:meta])*
+        for <$($TypeParam:ident),+> $MapType:ty,
+        where ($($WhereClause:tt)+)
+    ) => {
+        $(#[$meta])*
+        impl< $($TypeParam),+ > ToRedisArgs for $MapType
+        where
+            $($WhereClause)+
+        {
+            fn write_redis_args<W>(&self, out: &mut W)
+            where
+                W: ?Sized + RedisWrite,
+            {
+                for (key, value) in self {
+                    // Ensure key and value produce a single argument each
+                    assert!(key.num_of_args() <= 1 && value.num_of_args() <= 1);
+                    key.write_redis_args(out);
+                    value.write_redis_args(out);
+                }
+            }
 
-    fn num_of_args(&self) -> usize {
-        self.len()
-    }
-}
-
-/// this flattens BTreeMap into something that goes well with HMSET
-/// @note: Redis cannot store empty sets so the application has to
-/// check whether the set is empty and if so, not attempt to use that
-/// result
-impl<T: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs> ToRedisArgs for BTreeMap<T, V> {
-    fn write_redis_args<W>(&self, out: &mut W)
-    where
-        W: ?Sized + RedisWrite,
-    {
-        for (key, value) in self {
-            // otherwise things like HMSET will simply NOT work
-            assert!(key.num_of_args() <= 1 && value.num_of_args() <= 1);
-
-            key.write_redis_args(out);
-            value.write_redis_args(out);
+            fn num_of_args(&self) -> usize {
+                self.len()
+            }
         }
-    }
-
-    fn num_of_args(&self) -> usize {
-        self.len()
-    }
+    };
 }
+impl_to_redis_args_for_map!(
+    for <K, V> std::collections::HashMap<K, V>,
+    where (K: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs)
+);
 
-impl<T: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs> ToRedisArgs
-    for std::collections::HashMap<T, V>
-{
-    fn write_redis_args<W>(&self, out: &mut W)
-    where
-        W: ?Sized + RedisWrite,
-    {
-        for (key, value) in self {
-            assert!(key.num_of_args() <= 1 && value.num_of_args() <= 1);
+impl_to_redis_args_for_map!(
+    /// this flattens BTreeMap into something that goes well with HMSET
+    for <K, V> std::collections::BTreeMap<K, V>,
+    where (K: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs)
+);
 
-            key.write_redis_args(out);
-            value.write_redis_args(out);
-        }
-    }
-
-    fn num_of_args(&self) -> usize {
-        self.len()
-    }
-}
+#[cfg(feature = "hashbrown")]
+impl_to_redis_args_for_map!(
+    for <K, V> hashbrown::HashMap<K, V>,
+    where (K: ToRedisArgs + Hash + Eq + Ord, V: ToRedisArgs)
+);
 
 macro_rules! to_redis_args_for_tuple {
     () => ();
-    ($($name:ident,)+) => (
-        #[doc(hidden)]
+    ($(#[$meta:meta],)*$($name:ident,)+) => (
+        $(#[$meta])*
         impl<$($name: ToRedisArgs),*> ToRedisArgs for ($($name,)*) {
             // we have local variables named T1 as dummies and those
             // variables are unused.
@@ -1632,18 +1983,21 @@ macro_rules! to_redis_args_for_tuple {
                 n
             }
         }
-        to_redis_args_for_tuple_peel!($($name,)*);
     )
 }
 
-/// This chips of the leading one and recurses for the rest.  So if the first
-/// iteration was T1, T2, T3 it will recurse to T2, T3.  It stops for tuples
-/// of size 1 (does not implement down to unit).
-macro_rules! to_redis_args_for_tuple_peel {
-    ($name:ident, $($other:ident,)*) => (to_redis_args_for_tuple!($($other,)*);)
-}
-
-to_redis_args_for_tuple! { T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
+to_redis_args_for_tuple! { #[cfg_attr(docsrs, doc(fake_variadic))], #[doc = "This trait is implemented for tuples up to 12 items long."], T, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, T9, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, }
+to_redis_args_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
 
 impl<T: ToRedisArgs, const N: usize> ToRedisArgs for &[T; N] {
     fn write_redis_args<W>(&self, out: &mut W)
@@ -1678,7 +2032,7 @@ fn vec_to_array<T, const N: usize>(items: Vec<T>, original_value: &Value) -> Red
     }
 }
 
-impl<T: ?Sized + FromRedisValue, const N: usize> FromRedisValue for [T; N] {
+impl<T: FromRedisValue, const N: usize> FromRedisValue for [T; N] {
     fn from_redis_value(value: &Value) -> RedisResult<[T; N]> {
         match *value {
             Value::BulkString(ref bytes) => match FromRedisValue::from_byte_vec(bytes) {
@@ -1702,7 +2056,9 @@ impl<T: ?Sized + FromRedisValue, const N: usize> FromRedisValue for [T; N] {
 }
 
 /// This trait is used to convert a redis value into a more appropriate
-/// type.  While a redis `Value` can represent any response that comes
+/// type.
+///
+/// While a redis `Value` can represent any response that comes
 /// back from the redis server, usually you want to map this into something
 /// that works better in rust.  For instance you might want to convert the
 /// return value into a `String` or an integer.
@@ -1983,7 +2339,7 @@ macro_rules! pointer_from_redis_value_impl {
         $id:ident, $ty:ty, $func:expr
     ) => {
         $(#[$attr])*
-        impl<$id: ?Sized + FromRedisValue> FromRedisValue for $ty {
+        impl<$id:  FromRedisValue> FromRedisValue for $ty {
             fn from_redis_value(v: &Value) -> RedisResult<Self>
             {
                 FromRedisValue::from_redis_value(v).map($func)
@@ -2076,149 +2432,114 @@ from_vec_from_redis_value!(<T> Vec<T>);
 from_vec_from_redis_value!(<T> std::sync::Arc<[T]>);
 from_vec_from_redis_value!(<T> Box<[T]>; Vec::into_boxed_slice);
 
-impl<K: FromRedisValue + Eq + Hash, V: FromRedisValue, S: BuildHasher + Default> FromRedisValue
-    for std::collections::HashMap<K, V, S>
-{
-    fn from_redis_value(v: &Value) -> RedisResult<std::collections::HashMap<K, V, S>> {
-        let v = get_inner_value(v);
-        match *v {
-            Value::Nil => Ok(Default::default()),
-            _ => v
-                .as_map_iter()
-                .ok_or_else(|| {
-                    invalid_type_error_inner!(v, "Response type not hashmap compatible")
-                })?
-                .map(|(k, v)| Ok((from_redis_value(k)?, from_redis_value(v)?)))
-                .collect(),
+macro_rules! impl_from_redis_value_for_map {
+    (for <$($TypeParam:ident),+> $MapType:ty, where ($($WhereClause:tt)+)) => {
+        impl< $($TypeParam),+ > FromRedisValue for $MapType
+        where
+            $($WhereClause)+
+        {
+            fn from_redis_value(v: &Value) -> RedisResult<$MapType> {
+                let v = get_inner_value(v);
+                match *v {
+                    Value::Nil => Ok(Default::default()),
+                    _ => v
+                        .as_map_iter()
+                        .ok_or_else(|| invalid_type_error_inner!(v, "Response type not map compatible"))?
+                        .map(|(k, v)| {
+                            Ok((from_redis_value(k)?, from_redis_value(v)?))
+                        })
+                        .collect(),
+                }
+            }
+
+            fn from_owned_redis_value(v: Value) -> RedisResult<$MapType> {
+                let v = get_owned_inner_value(v);
+                match v {
+                    Value::Nil => Ok(Default::default()),
+                    _ => v
+                        .into_map_iter()
+                        .map_err(|v| invalid_type_error_inner!(v, "Response type not map compatible"))?
+                        .map(|(k, v)| {
+                            Ok((from_owned_redis_value(k)?, from_owned_redis_value(v)?))
+                        })
+                        .collect(),
+                }
+            }
         }
-    }
-    fn from_owned_redis_value(v: Value) -> RedisResult<std::collections::HashMap<K, V, S>> {
-        let v = get_owned_inner_value(v);
-        match v {
-            Value::Nil => Ok(Default::default()),
-            _ => v
-                .into_map_iter()
-                .map_err(|v| invalid_type_error_inner!(v, "Response type not hashmap compatible"))?
-                .map(|(k, v)| Ok((from_owned_redis_value(k)?, from_owned_redis_value(v)?)))
-                .collect(),
-        }
-    }
+    };
 }
+
+impl_from_redis_value_for_map!(
+    for <K, V, S> std::collections::HashMap<K, V, S>,
+    where (K: FromRedisValue + Eq + Hash, V: FromRedisValue, S: BuildHasher + Default)
+);
+
+#[cfg(feature = "hashbrown")]
+impl_from_redis_value_for_map!(
+    for <K, V, S> hashbrown::HashMap<K, V, S>,
+    where (K: FromRedisValue + Eq + Hash, V: FromRedisValue, S: BuildHasher + Default)
+);
 
 #[cfg(feature = "ahash")]
-impl<K: FromRedisValue + Eq + Hash, V: FromRedisValue> FromRedisValue for ahash::AHashMap<K, V> {
-    fn from_redis_value(v: &Value) -> RedisResult<ahash::AHashMap<K, V>> {
-        let v = get_inner_value(v);
-        match *v {
-            Value::Nil => Ok(ahash::AHashMap::with_hasher(Default::default())),
-            _ => v
-                .as_map_iter()
-                .ok_or_else(|| {
-                    invalid_type_error_inner!(v, "Response type not hashmap compatible")
-                })?
-                .map(|(k, v)| Ok((from_redis_value(k)?, from_redis_value(v)?)))
-                .collect(),
+impl_from_redis_value_for_map!(
+    for <K, V> ahash::AHashMap<K, V>,
+    where (K: FromRedisValue + Eq + Hash, V: FromRedisValue)
+);
+
+impl_from_redis_value_for_map!(
+    for <K, V> std::collections::BTreeMap<K, V>,
+    where (K: FromRedisValue + Eq + Hash + Ord, V: FromRedisValue)
+);
+
+macro_rules! impl_from_redis_value_for_set {
+    (for <$($TypeParam:ident),+> $SetType:ty, where ($($WhereClause:tt)+)) => {
+        impl< $($TypeParam),+ > FromRedisValue for $SetType
+        where
+            $($WhereClause)+
+        {
+            fn from_redis_value(v: &Value) -> RedisResult<$SetType> {
+                let v = get_inner_value(v);
+                let items = v
+                    .as_sequence()
+                    .ok_or_else(|| invalid_type_error_inner!(v, "Response type not map compatible"))?;
+                items.iter().map(|item| from_redis_value(item)).collect()
+            }
+
+            fn from_owned_redis_value(v: Value) -> RedisResult<$SetType> {
+                let v = get_owned_inner_value(v);
+                let items = v
+                    .into_sequence()
+                    .map_err(|v| invalid_type_error_inner!(v, "Response type not map compatible"))?;
+                items
+                    .into_iter()
+                    .map(|item| from_owned_redis_value(item))
+                    .collect()
+            }
         }
-    }
-    fn from_owned_redis_value(v: Value) -> RedisResult<ahash::AHashMap<K, V>> {
-        let v = get_owned_inner_value(v);
-        match v {
-            Value::Nil => Ok(ahash::AHashMap::with_hasher(Default::default())),
-            _ => v
-                .into_map_iter()
-                .map_err(|v| invalid_type_error_inner!(v, "Response type not hashmap compatible"))?
-                .map(|(k, v)| Ok((from_owned_redis_value(k)?, from_owned_redis_value(v)?)))
-                .collect(),
-        }
-    }
+    };
 }
 
-impl<K: FromRedisValue + Eq + Hash, V: FromRedisValue> FromRedisValue for BTreeMap<K, V>
-where
-    K: Ord,
-{
-    fn from_redis_value(v: &Value) -> RedisResult<BTreeMap<K, V>> {
-        let v = get_inner_value(v);
-        v.as_map_iter()
-            .ok_or_else(|| invalid_type_error_inner!(v, "Response type not btreemap compatible"))?
-            .map(|(k, v)| Ok((from_redis_value(k)?, from_redis_value(v)?)))
-            .collect()
-    }
-    fn from_owned_redis_value(v: Value) -> RedisResult<BTreeMap<K, V>> {
-        let v = get_owned_inner_value(v);
-        v.into_map_iter()
-            .map_err(|v| invalid_type_error_inner!(v, "Response type not btreemap compatible"))?
-            .map(|(k, v)| Ok((from_owned_redis_value(k)?, from_owned_redis_value(v)?)))
-            .collect()
-    }
-}
+impl_from_redis_value_for_set!(
+    for <T, S> std::collections::HashSet<T, S>,
+    where (T: FromRedisValue + Eq + Hash, S: BuildHasher + Default)
+);
 
-impl<T: FromRedisValue + Eq + Hash, S: BuildHasher + Default> FromRedisValue
-    for std::collections::HashSet<T, S>
-{
-    fn from_redis_value(v: &Value) -> RedisResult<std::collections::HashSet<T, S>> {
-        let v = get_inner_value(v);
-        let items = v
-            .as_sequence()
-            .ok_or_else(|| invalid_type_error_inner!(v, "Response type not hashset compatible"))?;
-        items.iter().map(|item| from_redis_value(item)).collect()
-    }
-    fn from_owned_redis_value(v: Value) -> RedisResult<std::collections::HashSet<T, S>> {
-        let v = get_owned_inner_value(v);
-        let items = v
-            .into_sequence()
-            .map_err(|v| invalid_type_error_inner!(v, "Response type not hashset compatible"))?;
-        items
-            .into_iter()
-            .map(|item| from_owned_redis_value(item))
-            .collect()
-    }
-}
+impl_from_redis_value_for_set!(
+    for <T> std::collections::BTreeSet<T>,
+    where (T: FromRedisValue + Eq + Ord)
+);
+
+#[cfg(feature = "hashbrown")]
+impl_from_redis_value_for_set!(
+    for <T, S> hashbrown::HashSet<T, S>,
+    where (T: FromRedisValue + Eq + Hash, S: BuildHasher + Default)
+);
 
 #[cfg(feature = "ahash")]
-impl<T: FromRedisValue + Eq + Hash> FromRedisValue for ahash::AHashSet<T> {
-    fn from_redis_value(v: &Value) -> RedisResult<ahash::AHashSet<T>> {
-        let v = get_inner_value(v);
-        let items = v
-            .as_sequence()
-            .ok_or_else(|| invalid_type_error_inner!(v, "Response type not hashset compatible"))?;
-        items.iter().map(|item| from_redis_value(item)).collect()
-    }
-
-    fn from_owned_redis_value(v: Value) -> RedisResult<ahash::AHashSet<T>> {
-        let v = get_owned_inner_value(v);
-        let items = v
-            .into_sequence()
-            .map_err(|v| invalid_type_error_inner!(v, "Response type not hashset compatible"))?;
-        items
-            .into_iter()
-            .map(|item| from_owned_redis_value(item))
-            .collect()
-    }
-}
-
-impl<T: FromRedisValue + Eq + Hash> FromRedisValue for BTreeSet<T>
-where
-    T: Ord,
-{
-    fn from_redis_value(v: &Value) -> RedisResult<BTreeSet<T>> {
-        let v = get_inner_value(v);
-        let items = v
-            .as_sequence()
-            .ok_or_else(|| invalid_type_error_inner!(v, "Response type not btreeset compatible"))?;
-        items.iter().map(|item| from_redis_value(item)).collect()
-    }
-    fn from_owned_redis_value(v: Value) -> RedisResult<BTreeSet<T>> {
-        let v = get_owned_inner_value(v);
-        let items = v
-            .into_sequence()
-            .map_err(|v| invalid_type_error_inner!(v, "Response type not btreeset compatible"))?;
-        items
-            .into_iter()
-            .map(|item| from_owned_redis_value(item))
-            .collect()
-    }
-}
+impl_from_redis_value_for_set!(
+    for <T> ahash::AHashSet<T>,
+    where (T: FromRedisValue + Eq + Hash)
+);
 
 impl FromRedisValue for Value {
     fn from_redis_value(v: &Value) -> RedisResult<Value> {
@@ -2237,8 +2558,8 @@ impl FromRedisValue for () {
 
 macro_rules! from_redis_value_for_tuple {
     () => ();
-    ($($name:ident,)+) => (
-        #[doc(hidden)]
+    ($(#[$meta:meta],)*$($name:ident,)+) => (
+        $(#[$meta])*
         impl<$($name: FromRedisValue),*> FromRedisValue for ($($name,)*) {
             // we have local variables named T1 as dummies and those
             // variables are unused.
@@ -2348,9 +2669,7 @@ macro_rules! from_redis_value_for_tuple {
                         Value::Array(ch) => {
                            if  let [$($name),*] = &ch[..] {
                             rv.push(($(from_redis_value(&$name)?),*),)
-                           } else {
-                                unreachable!()
-                            };
+                           };
                         },
                         _ => {},
 
@@ -2384,15 +2703,12 @@ macro_rules! from_redis_value_for_tuple {
                     return Ok(rv)
                 }
                 //It's uglier then before!
-                for item in items.iter() {
+                for item in items.iter_mut() {
                     match item {
-                        Value::Array(ch) => {
-                            // TODO - this copies when we could've used the owned value. need to find out how to do this.
-                        if  let [$($name),*] = &ch[..] {
-                            rv.push(($(from_redis_value($name)?),*),)
-                           } else {
-                                unreachable!()
-                            };
+                        Value::Array(ref mut ch) => {
+                        if  let [$($name),*] = &mut ch[..] {
+                            rv.push(($(from_owned_redis_value(std::mem::replace($name, Value::Nil))?),*),);
+                           };
                         },
                         _ => {},
                     }
@@ -2418,18 +2734,21 @@ macro_rules! from_redis_value_for_tuple {
                 Ok(rv)
             }
         }
-        from_redis_value_for_tuple_peel!($($name,)*);
     )
 }
 
-/// This chips of the leading one and recurses for the rest.  So if the first
-/// iteration was T1, T2, T3 it will recurse to T2, T3.  It stops for tuples
-/// of size 1 (does not implement down to unit).
-macro_rules! from_redis_value_for_tuple_peel {
-    ($name:ident, $($other:ident,)*) => (from_redis_value_for_tuple!($($other,)*);)
-}
-
-from_redis_value_for_tuple! { T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
+from_redis_value_for_tuple! { #[cfg_attr(docsrs, doc(fake_variadic))], #[doc = "This trait is implemented for tuples up to 12 items long."], T, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, T9, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, }
+from_redis_value_for_tuple! { #[doc(hidden)], T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, }
 
 impl FromRedisValue for InfoDict {
     fn from_redis_value(v: &Value) -> RedisResult<InfoDict> {
@@ -2511,8 +2830,10 @@ pub fn from_owned_redis_value<T: FromRedisValue>(v: Value) -> RedisResult<T> {
     FromRedisValue::from_owned_redis_value(v)
 }
 
-/// Enum representing the communication protocol with the server. This enum represents the types
-/// of data that the server can send to the client, and the capabilities that the client can use.
+/// Enum representing the communication protocol with the server.
+///
+/// This enum represents the types of data that the server can send to the client,
+/// and the capabilities that the client can use.
 #[derive(Clone, Eq, PartialEq, Default, Debug, Copy)]
 pub enum ProtocolVersion {
     /// <https://github.com/redis/redis-specifications/blob/master/protocol/RESP2.md>
@@ -2552,7 +2873,7 @@ impl ToRedisArgs for ExpireOption {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 /// A push message from the server.
 pub struct PushInfo {
     /// Push Kind
@@ -2561,7 +2882,19 @@ pub struct PushInfo {
     pub data: Vec<Value>,
 }
 
-#[cfg(feature = "aio")]
-pub(crate) type AsyncPushSender = tokio::sync::mpsc::UnboundedSender<PushInfo>;
+impl PushInfo {
+    pub(crate) fn disconnect() -> Self {
+        PushInfo {
+            kind: crate::PushKind::Disconnection,
+            data: vec![],
+        }
+    }
+}
 
 pub(crate) type SyncPushSender = std::sync::mpsc::Sender<PushInfo>;
+
+// A consistent error value for connections closed without a reason.
+#[cfg(any(feature = "aio", feature = "r2d2"))]
+pub(crate) fn closed_connection_error() -> RedisError {
+    RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe))
+}

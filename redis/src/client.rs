@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 #[cfg(feature = "aio")]
-use crate::types::AsyncPushSender;
+use crate::aio::{AsyncPushSender, DefaultAsyncDNSResolver};
+#[cfg(feature = "aio")]
+use crate::io::{tcp::TcpSettings, AsyncDNSResolver};
 use crate::{
     connection::{connect, Connection, ConnectionInfo, ConnectionLike, IntoConnectionInfo},
     types::{RedisResult, Value},
@@ -11,6 +13,11 @@ use std::pin::Pin;
 
 #[cfg(feature = "tls-rustls")]
 use crate::tls::{inner_build_with_tls, TlsCertificates};
+
+#[cfg(feature = "cache-aio")]
+use crate::caching::CacheConfig;
+#[cfg(all(feature = "cache-aio", feature = "connection-manager"))]
+use crate::caching::CacheManager;
 
 /// The client type.
 #[derive(Debug, Clone)]
@@ -66,6 +73,102 @@ impl Client {
     pub fn get_connection_info(&self) -> &ConnectionInfo {
         &self.connection_info
     }
+
+    /// Constructs a new `Client` with parameters necessary to create a TLS connection.
+    ///
+    /// - `conn_info` - URL using the `rediss://` scheme.
+    /// - `tls_certs` - `TlsCertificates` structure containing:
+    ///     - `client_tls` - Optional `ClientTlsConfig` containing byte streams for
+    ///         - `client_cert` - client's byte stream containing client certificate in PEM format
+    ///         - `client_key` - client's byte stream containing private key in PEM format
+    ///     - `root_cert` - Optional byte stream yielding PEM formatted file for root certificates.
+    ///
+    /// If `ClientTlsConfig` ( cert+key pair ) is not provided, then client-side authentication is not enabled.
+    /// If `root_cert` is not provided, then system root certificates are used instead.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::{fs::File, io::{BufReader, Read}};
+    ///
+    /// use redis::{Client, AsyncCommands as _, TlsCertificates, ClientTlsConfig};
+    ///
+    /// async fn do_redis_code(
+    ///     url: &str,
+    ///     root_cert_file: &str,
+    ///     cert_file: &str,
+    ///     key_file: &str
+    /// ) -> redis::RedisResult<()> {
+    ///     let root_cert_file = File::open(root_cert_file).expect("cannot open private cert file");
+    ///     let mut root_cert_vec = Vec::new();
+    ///     BufReader::new(root_cert_file)
+    ///         .read_to_end(&mut root_cert_vec)
+    ///         .expect("Unable to read ROOT cert file");
+    ///
+    ///     let cert_file = File::open(cert_file).expect("cannot open private cert file");
+    ///     let mut client_cert_vec = Vec::new();
+    ///     BufReader::new(cert_file)
+    ///         .read_to_end(&mut client_cert_vec)
+    ///         .expect("Unable to read client cert file");
+    ///
+    ///     let key_file = File::open(key_file).expect("cannot open private key file");
+    ///     let mut client_key_vec = Vec::new();
+    ///     BufReader::new(key_file)
+    ///         .read_to_end(&mut client_key_vec)
+    ///         .expect("Unable to read client key file");
+    ///
+    ///     let client = Client::build_with_tls(
+    ///         url,
+    ///         TlsCertificates {
+    ///             client_tls: Some(ClientTlsConfig{
+    ///                 client_cert: client_cert_vec,
+    ///                 client_key: client_key_vec,
+    ///             }),
+    ///             root_cert: Some(root_cert_vec),
+    ///         }
+    ///     )
+    ///     .expect("Unable to build client");
+    ///
+    ///     let connection_info = client.get_connection_info();
+    ///
+    ///     println!(">>> connection info: {connection_info:?}");
+    ///
+    ///     let mut con = client.get_multiplexed_async_connection().await?;
+    ///
+    ///     con.set("key1", b"foo").await?;
+    ///
+    ///     redis::cmd("SET")
+    ///         .arg(&["key2", "bar"])
+    ///         .exec_async(&mut con)
+    ///         .await?;
+    ///
+    ///     let result = redis::cmd("MGET")
+    ///         .arg(&["key1", "key2"])
+    ///         .query_async(&mut con)
+    ///         .await;
+    ///     assert_eq!(result, Ok(("foo".to_string(), b"bar".to_vec())));
+    ///     println!("Result from MGET: {result:?}");
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(feature = "tls-rustls")]
+    pub fn build_with_tls<C: IntoConnectionInfo>(
+        conn_info: C,
+        tls_certs: TlsCertificates,
+    ) -> RedisResult<Client> {
+        let connection_info = conn_info.into_connection_info()?;
+
+        inner_build_with_tls(connection_info, &tls_certs)
+    }
+}
+
+#[cfg(feature = "cache-aio")]
+#[derive(Clone)]
+pub(crate) enum Cache {
+    Config(CacheConfig),
+    #[cfg(feature = "connection-manager")]
+    Manager(CacheManager),
 }
 
 /// Options for creation of async connection
@@ -76,7 +179,11 @@ pub struct AsyncConnectionConfig {
     pub(crate) response_timeout: Option<std::time::Duration>,
     /// Maximum time to wait for a connection to be established
     pub(crate) connection_timeout: Option<std::time::Duration>,
-    pub(crate) push_sender: Option<AsyncPushSender>,
+    pub(crate) push_sender: Option<std::sync::Arc<dyn AsyncPushSender>>,
+    #[cfg(feature = "cache-aio")]
+    pub(crate) cache: Option<Cache>,
+    pub(crate) tcp_settings: TcpSettings,
+    pub(crate) dns_resolver: Option<std::sync::Arc<dyn AsyncDNSResolver>>,
 }
 
 #[cfg(feature = "aio")]
@@ -98,9 +205,76 @@ impl AsyncConnectionConfig {
         self
     }
 
-    /// Sets sender channel for push values. Will fail client creation if the connection isn't configured for RESP3 communications.
-    pub fn set_push_sender(mut self, sender: AsyncPushSender) -> Self {
+    /// Sets sender sender for push values.
+    ///
+    /// The sender can be a channel, or an arbitrary function that handles [crate::PushInfo] values.
+    /// This will fail client creation if the connection isn't configured for RESP3 communications via the [crate::RedisConnectionInfo::protocol] field.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use redis::AsyncConnectionConfig;
+    /// let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    /// let config = AsyncConnectionConfig::new().set_push_sender(tx);
+    /// ```
+    ///
+    /// ```rust
+    /// # use std::sync::{Mutex, Arc};
+    /// # use redis::AsyncConnectionConfig;
+    /// let messages = Arc::new(Mutex::new(Vec::new()));
+    /// let config = AsyncConnectionConfig::new().set_push_sender(move |msg|{
+    ///     let Ok(mut messages) = messages.lock() else {
+    ///         return Err(redis::aio::SendError);
+    ///     };
+    ///     messages.push(msg);
+    ///     Ok(())
+    /// });
+    /// ```
+    pub fn set_push_sender(self, sender: impl AsyncPushSender) -> Self {
+        self.set_push_sender_internal(std::sync::Arc::new(sender))
+    }
+
+    pub(crate) fn set_push_sender_internal(
+        mut self,
+        sender: std::sync::Arc<dyn AsyncPushSender>,
+    ) -> Self {
         self.push_sender = Some(sender);
+        self
+    }
+
+    /// Sets cache config for MultiplexedConnection, check CacheConfig for more details.
+    #[cfg(feature = "cache-aio")]
+    pub fn set_cache_config(mut self, cache_config: CacheConfig) -> Self {
+        self.cache = Some(Cache::Config(cache_config));
+        self
+    }
+
+    #[cfg(all(feature = "cache-aio", feature = "connection-manager"))]
+    pub(crate) fn set_cache_manager(mut self, cache_manager: CacheManager) -> Self {
+        self.cache = Some(Cache::Manager(cache_manager));
+        self
+    }
+
+    /// Set the behavior of the underlying TCP connection.
+    pub fn set_tcp_settings(self, tcp_settings: crate::io::tcp::TcpSettings) -> Self {
+        Self {
+            tcp_settings,
+            ..self
+        }
+    }
+
+    /// Set the DNS resolver for the underlying TCP connection.
+    ///
+    /// The parameter resolver must implement the [`crate::io::AsyncDNSResolver`] trait.
+    pub fn set_dns_resolver(self, dns_resolver: impl AsyncDNSResolver) -> Self {
+        self.set_dns_resolver_internal(std::sync::Arc::new(dns_resolver))
+    }
+
+    pub(super) fn set_dns_resolver_internal(
+        mut self,
+        dns_resolver: std::sync::Arc<dyn AsyncDNSResolver>,
+    ) -> Self {
+        self.dns_resolver = Some(dns_resolver);
         self
     }
 }
@@ -111,66 +285,8 @@ impl AsyncConnectionConfig {
 #[cfg_attr(docsrs, doc(cfg(feature = "aio")))]
 impl Client {
     /// Returns an async connection from the client.
-    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
-    #[deprecated(
-        note = "aio::Connection is deprecated. Use client::get_multiplexed_async_connection instead."
-    )]
-    #[allow(deprecated)]
-    pub async fn get_async_connection(&self) -> RedisResult<crate::aio::Connection> {
-        let con = match Runtime::locate() {
-            #[cfg(feature = "tokio-comp")]
-            Runtime::Tokio => {
-                self.get_simple_async_connection::<crate::aio::tokio::Tokio>()
-                    .await?
-            }
-            #[cfg(feature = "async-std-comp")]
-            Runtime::AsyncStd => {
-                self.get_simple_async_connection::<crate::aio::async_std::AsyncStd>()
-                    .await?
-            }
-        };
-
-        crate::aio::Connection::new(&self.connection_info.redis, con).await
-    }
-
-    /// Returns an async connection from the client.
-    #[cfg(feature = "tokio-comp")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio-comp")))]
-    #[deprecated(
-        note = "aio::Connection is deprecated. Use client::get_multiplexed_tokio_connection instead."
-    )]
-    #[allow(deprecated)]
-    pub async fn get_tokio_connection(&self) -> RedisResult<crate::aio::Connection> {
-        use crate::aio::RedisRuntime;
-        Ok(
-            crate::aio::connect::<crate::aio::tokio::Tokio>(&self.connection_info)
-                .await?
-                .map(RedisRuntime::boxed),
-        )
-    }
-
-    /// Returns an async connection from the client.
-    #[cfg(feature = "async-std-comp")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
-    #[deprecated(
-        note = "aio::Connection is deprecated. Use client::get_multiplexed_async_std_connection instead."
-    )]
-    #[allow(deprecated)]
-    pub async fn get_async_std_connection(&self) -> RedisResult<crate::aio::Connection> {
-        use crate::aio::RedisRuntime;
-        Ok(
-            crate::aio::connect::<crate::aio::async_std::AsyncStd>(&self.connection_info)
-                .await?
-                .map(RedisRuntime::boxed),
-        )
-    }
-
-    /// Returns an async connection from the client.
-    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(feature = "tokio-comp", feature = "async-std-comp")))
-    )]
+    #[cfg(feature = "aio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "aio")))]
     pub async fn get_multiplexed_async_connection(
         &self,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
@@ -179,11 +295,8 @@ impl Client {
     }
 
     /// Returns an async connection from the client.
-    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(feature = "tokio-comp", feature = "async-std-comp")))
-    )]
+    #[cfg(feature = "aio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "aio")))]
     #[deprecated(note = "Use `get_multiplexed_async_connection_with_config` instead")]
     pub async fn get_multiplexed_async_connection_with_timeouts(
         &self,
@@ -199,56 +312,31 @@ impl Client {
     }
 
     /// Returns an async connection from the client.
-    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(feature = "tokio-comp", feature = "async-std-comp")))
-    )]
+    #[cfg(feature = "aio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "aio")))]
     pub async fn get_multiplexed_async_connection_with_config(
         &self,
         config: &AsyncConnectionConfig,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
-        let result = match Runtime::locate() {
+        match Runtime::locate() {
             #[cfg(feature = "tokio-comp")]
-            rt @ Runtime::Tokio => {
-                if let Some(connection_timeout) = config.connection_timeout {
-                    rt.timeout(
-                        connection_timeout,
-                        self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
-                            config,
-                        ),
-                    )
-                    .await
-                } else {
-                    Ok(self
-                        .get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(config)
-                        .await)
-                }
-            }
-            #[cfg(feature = "async-std-comp")]
-            rt @ Runtime::AsyncStd => {
-                if let Some(connection_timeout) = config.connection_timeout {
-                    rt.timeout(
-                        connection_timeout,
-                        self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
-                            config,
-                        ),
-                    )
-                    .await
-                } else {
-                    Ok(self
-                        .get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
-                            config,
-                        )
-                        .await)
-                }
-            }
-        };
+            rt @ Runtime::Tokio => self
+                .get_multiplexed_async_connection_inner_with_timeout::<crate::aio::tokio::Tokio>(
+                    config, rt,
+                )
+                .await,
 
-        match result {
-            Ok(Ok(connection)) => Ok(connection),
-            Ok(Err(e)) => Err(e),
-            Err(elapsed) => Err(elapsed.into()),
+            #[cfg(feature = "async-std-comp")]
+            rt @ Runtime::AsyncStd => self.get_multiplexed_async_connection_inner_with_timeout::<
+                crate::aio::async_std::AsyncStd,
+            >(config, rt)
+            .await,
+
+            #[cfg(feature = "smol-comp")]
+            rt @ Runtime::Smol => self.get_multiplexed_async_connection_inner_with_timeout::<
+                crate::aio::smol::Smol,
+            >(config, rt)
+            .await,
         }
     }
 
@@ -337,7 +425,7 @@ impl Client {
     }
 
     /// Returns an async multiplexed connection from the client and a future which must be polled
-    /// to drive any requests submitted to it (see `get_multiplexed_tokio_connection`).
+    /// to drive any requests submitted to it (see [Self::get_multiplexed_async_connection]).
     ///
     /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
     /// on the same underlying connection (tcp/unix socket).
@@ -358,7 +446,7 @@ impl Client {
     }
 
     /// Returns an async multiplexed connection from the client and a future which must be polled
-    /// to drive any requests submitted to it (see `get_multiplexed_tokio_connection`).
+    /// to drive any requests submitted to it (see [Self::get_multiplexed_async_connection]).
     ///
     /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
     /// on the same underlying connection (tcp/unix socket).
@@ -377,7 +465,7 @@ impl Client {
     }
 
     /// Returns an async multiplexed connection from the client and a future which must be polled
-    /// to drive any requests submitted to it (see `get_multiplexed_tokio_connection`).
+    /// to drive any requests submitted to it (see [Self::get_multiplexed_async_connection]).
     ///
     /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
     /// on the same underlying connection (tcp/unix socket).
@@ -398,7 +486,7 @@ impl Client {
     }
 
     /// Returns an async multiplexed connection from the client and a future which must be polled
-    /// to drive any requests submitted to it (see `get_multiplexed_tokio_connection`).
+    /// to drive any requests submitted to it (see [Self::get_multiplexed_async_connection]).
     ///
     /// A multiplexed connection can be cloned, allowing requests to be sent concurrently
     /// on the same underlying connection (tcp/unix socket).
@@ -637,6 +725,33 @@ impl Client {
         crate::aio::ConnectionManager::new_with_config(self.clone(), config).await
     }
 
+    async fn get_multiplexed_async_connection_inner_with_timeout<T>(
+        &self,
+        config: &AsyncConnectionConfig,
+        rt: Runtime,
+    ) -> RedisResult<crate::aio::MultiplexedConnection>
+    where
+        T: crate::aio::RedisRuntime,
+    {
+        let result = if let Some(connection_timeout) = config.connection_timeout {
+            rt.timeout(
+                connection_timeout,
+                self.get_multiplexed_async_connection_inner::<T>(config),
+            )
+            .await
+        } else {
+            Ok(self
+                .get_multiplexed_async_connection_inner::<T>(config)
+                .await)
+        };
+
+        match result {
+            Ok(Ok(connection)) => Ok(connection),
+            Ok(Err(e)) => Err(e),
+            Err(elapsed) => Err(elapsed.into()),
+        }
+    }
+
     async fn get_multiplexed_async_connection_inner<T>(
         &self,
         config: &AsyncConnectionConfig,
@@ -644,10 +759,11 @@ impl Client {
     where
         T: crate::aio::RedisRuntime,
     {
-        let (connection, driver) = self
+        let (mut connection, driver) = self
             .create_multiplexed_async_connection_inner::<T>(config)
             .await?;
-        T::spawn(driver);
+        let handle = T::spawn(driver);
+        connection.set_task_handle(handle);
         Ok(connection)
     }
 
@@ -661,24 +777,69 @@ impl Client {
     where
         T: crate::aio::RedisRuntime,
     {
-        let con = self.get_simple_async_connection::<T>().await?;
+        let resolver = config
+            .dns_resolver
+            .as_deref()
+            .unwrap_or(&DefaultAsyncDNSResolver);
+        let con = self
+            .get_simple_async_connection::<T>(resolver, &config.tcp_settings)
+            .await?;
         crate::aio::MultiplexedConnection::new_with_config(
-            &self.connection_info,
+            &self.connection_info.redis,
             con,
             config.clone(),
         )
         .await
     }
 
+    async fn get_simple_async_connection_dynamically(
+        &self,
+        dns_resolver: &dyn AsyncDNSResolver,
+        tcp_settings: &TcpSettings,
+    ) -> RedisResult<Pin<Box<dyn crate::aio::AsyncStream + Send + Sync>>> {
+        match Runtime::locate() {
+            #[cfg(feature = "tokio-comp")]
+            Runtime::Tokio => {
+                self.get_simple_async_connection::<crate::aio::tokio::Tokio>(
+                    dns_resolver,
+                    tcp_settings,
+                )
+                .await
+            }
+
+            #[cfg(feature = "async-std-comp")]
+            Runtime::AsyncStd => {
+                self.get_simple_async_connection::<crate::aio::async_std::AsyncStd>(
+                    dns_resolver,
+                    tcp_settings,
+                )
+                .await
+            }
+
+            #[cfg(feature = "smol-comp")]
+            Runtime::Smol => {
+                self.get_simple_async_connection::<crate::aio::smol::Smol>(
+                    dns_resolver,
+                    tcp_settings,
+                )
+                .await
+            }
+        }
+    }
+
     async fn get_simple_async_connection<T>(
         &self,
+        dns_resolver: &dyn AsyncDNSResolver,
+        tcp_settings: &TcpSettings,
     ) -> RedisResult<Pin<Box<dyn crate::aio::AsyncStream + Send + Sync>>>
     where
         T: crate::aio::RedisRuntime,
     {
-        Ok(crate::aio::connect_simple::<T>(&self.connection_info)
-            .await?
-            .boxed())
+        Ok(
+            crate::aio::connect_simple::<T>(&self.connection_info, dns_resolver, tcp_settings)
+                .await?
+                .boxed(),
+        )
     }
 
     #[cfg(feature = "connection-manager")]
@@ -686,112 +847,30 @@ impl Client {
         &self.connection_info
     }
 
-    /// Constructs a new `Client` with parameters necessary to create a TLS connection.
-    ///
-    /// - `conn_info` - URL using the `rediss://` scheme.
-    /// - `tls_certs` - `TlsCertificates` structure containing:
-    ///     - `client_tls` - Optional `ClientTlsConfig` containing byte streams for
-    ///         - `client_cert` - client's byte stream containing client certificate in PEM format
-    ///         - `client_key` - client's byte stream containing private key in PEM format
-    ///     - `root_cert` - Optional byte stream yielding PEM formatted file for root certificates.
-    ///
-    /// If `ClientTlsConfig` ( cert+key pair ) is not provided, then client-side authentication is not enabled.
-    /// If `root_cert` is not provided, then system root certificates are used instead.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::{fs::File, io::{BufReader, Read}};
-    ///
-    /// use redis::{Client, AsyncCommands as _, TlsCertificates, ClientTlsConfig};
-    ///
-    /// async fn do_redis_code(
-    ///     url: &str,
-    ///     root_cert_file: &str,
-    ///     cert_file: &str,
-    ///     key_file: &str
-    /// ) -> redis::RedisResult<()> {
-    ///     let root_cert_file = File::open(root_cert_file).expect("cannot open private cert file");
-    ///     let mut root_cert_vec = Vec::new();
-    ///     BufReader::new(root_cert_file)
-    ///         .read_to_end(&mut root_cert_vec)
-    ///         .expect("Unable to read ROOT cert file");
-    ///
-    ///     let cert_file = File::open(cert_file).expect("cannot open private cert file");
-    ///     let mut client_cert_vec = Vec::new();
-    ///     BufReader::new(cert_file)
-    ///         .read_to_end(&mut client_cert_vec)
-    ///         .expect("Unable to read client cert file");
-    ///
-    ///     let key_file = File::open(key_file).expect("cannot open private key file");
-    ///     let mut client_key_vec = Vec::new();
-    ///     BufReader::new(key_file)
-    ///         .read_to_end(&mut client_key_vec)
-    ///         .expect("Unable to read client key file");
-    ///
-    ///     let client = Client::build_with_tls(
-    ///         url,
-    ///         TlsCertificates {
-    ///             client_tls: Some(ClientTlsConfig{
-    ///                 client_cert: client_cert_vec,
-    ///                 client_key: client_key_vec,
-    ///             }),
-    ///             root_cert: Some(root_cert_vec),
-    ///         }
-    ///     )
-    ///     .expect("Unable to build client");
-    ///
-    ///     let connection_info = client.get_connection_info();
-    ///
-    ///     println!(">>> connection info: {connection_info:?}");
-    ///
-    ///     let mut con = client.get_multiplexed_async_connection().await?;
-    ///
-    ///     con.set("key1", b"foo").await?;
-    ///
-    ///     redis::cmd("SET")
-    ///         .arg(&["key2", "bar"])
-    ///         .exec_async(&mut con)
-    ///         .await?;
-    ///
-    ///     let result = redis::cmd("MGET")
-    ///         .arg(&["key1", "key2"])
-    ///         .query_async(&mut con)
-    ///         .await;
-    ///     assert_eq!(result, Ok(("foo".to_string(), b"bar".to_vec())));
-    ///     println!("Result from MGET: {result:?}");
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
-    #[cfg(feature = "tls-rustls")]
-    pub fn build_with_tls<C: IntoConnectionInfo>(
-        conn_info: C,
-        tls_certs: TlsCertificates,
-    ) -> RedisResult<Client> {
-        let connection_info = conn_info.into_connection_info()?;
-
-        inner_build_with_tls(connection_info, tls_certs)
-    }
-
     /// Returns an async receiver for pub-sub messages.
-    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
+    #[cfg(feature = "aio")]
     // TODO - do we want to type-erase pubsub using a trait, to allow us to replace it with a different implementation later?
     pub async fn get_async_pubsub(&self) -> RedisResult<crate::aio::PubSub> {
-        #[allow(deprecated)]
-        self.get_async_connection()
-            .await
-            .map(|connection| connection.into_pubsub())
+        let connection = self
+            .get_simple_async_connection_dynamically(
+                &DefaultAsyncDNSResolver,
+                &TcpSettings::default(),
+            )
+            .await?;
+
+        crate::aio::PubSub::new(&self.connection_info.redis, connection).await
     }
 
     /// Returns an async receiver for monitor messages.
-    #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
-    // TODO - do we want to type-erase monitor using a trait, to allow us to replace it with a different implementation later?
+    #[cfg(feature = "aio")]
     pub async fn get_async_monitor(&self) -> RedisResult<crate::aio::Monitor> {
-        #[allow(deprecated)]
-        self.get_async_connection()
-            .await
-            .map(|connection| connection.into_monitor())
+        let connection = self
+            .get_simple_async_connection_dynamically(
+                &DefaultAsyncDNSResolver,
+                &TcpSettings::default(),
+            )
+            .await?;
+        crate::aio::Monitor::new(&self.connection_info.redis, connection).await
     }
 }
 

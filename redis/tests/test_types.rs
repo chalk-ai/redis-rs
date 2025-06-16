@@ -1,7 +1,12 @@
 mod support;
 
 mod types {
-    use std::{rc::Rc, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        error::Error,
+        rc::Rc,
+        sync::Arc,
+    };
 
     use redis::{ErrorKind, FromRedisValue, RedisError, RedisResult, ToRedisArgs, Value};
 
@@ -12,6 +17,46 @@ mod types {
             "Multiplexed connection driver unexpectedly terminated",
         ));
         assert!(err.is_io_error());
+    }
+
+    #[test]
+    fn test_redis_error_source_presence_for_io_wrapped_errors() {
+        let io_error = RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "I/O failure",
+        ));
+        let source = io_error.source();
+        assert_eq!(io_error.kind(), redis::ErrorKind::IoError);
+
+        assert!(source.is_some());
+        assert_eq!(source.unwrap().to_string(), "I/O failure");
+    }
+
+    #[test]
+    fn test_redis_error_source_absence_for_non_io_wrapped_errors() {
+        // Even though the ErrorKind is IoError, no actual I/O error is wrapped, so the source should be None.
+        let simulated_io_error = RedisError::from((ErrorKind::IoError, "Simulated I/O error"));
+        // Similarly this error is not an Extension error, even though it's ErrorKind is ExtensionError
+        let simulated_extension_error =
+            RedisError::from((ErrorKind::ExtensionError, "Simulated extension error"));
+        let simulated_type_error_with_details = RedisError::from((
+            ErrorKind::TypeError,
+            "Simulated type error",
+            "Type error details".to_string(),
+        ));
+
+        let an_extension_error =
+            redis::make_extension_error("A true extension error".to_string(), None);
+        assert_eq!(an_extension_error.kind(), redis::ErrorKind::ExtensionError);
+
+        for error in [
+            simulated_io_error,
+            simulated_extension_error,
+            simulated_type_error_with_details,
+            an_extension_error,
+        ] {
+            assert!(error.source().is_none());
+        }
     }
 
     #[test]
@@ -76,6 +121,90 @@ mod types {
             assert_eq!(d.get("key1"), Some("foo".to_string()));
             assert_eq!(d.get("key2"), Some(42i64));
             assert_eq!(d.get::<String>("key3"), None);
+        }
+    }
+
+    #[test]
+    fn test_role_ret() {
+        use redis::ReplicaInfo;
+        use redis::Role;
+
+        let parse_models = [RedisParseMode::Owned, RedisParseMode::Ref];
+        let test_cases = vec![
+            (
+                Value::Array(vec![
+                    Value::BulkString("master".into()),
+                    Value::Int(3129659),
+                    Value::Array(vec![
+                        Value::Array(vec![
+                            Value::BulkString("127.0.0.1".into()),
+                            Value::BulkString("9001".into()),
+                            Value::BulkString("3129242".into()),
+                        ]),
+                        Value::Array(vec![
+                            Value::BulkString("127.0.0.1".into()),
+                            Value::BulkString("9002".into()),
+                            Value::BulkString("3129543".into()),
+                        ]),
+                    ]),
+                ]),
+                Role::Primary {
+                    replication_offset: 3129659,
+                    replicas: vec![
+                        ReplicaInfo {
+                            ip: "127.0.0.1".to_string(),
+                            port: 9001,
+                            replication_offset: 3129242,
+                        },
+                        ReplicaInfo {
+                            ip: "127.0.0.1".to_string(),
+                            port: 9002,
+                            replication_offset: 3129543,
+                        },
+                    ],
+                },
+            ),
+            (
+                Value::Array(vec![
+                    Value::BulkString("slave".into()),
+                    Value::BulkString("127.0.0.1".into()),
+                    Value::Int(9000),
+                    Value::BulkString("connected".into()),
+                    Value::Int(3167038),
+                ]),
+                Role::Replica {
+                    primary_ip: "127.0.0.1".to_string(),
+                    primary_port: 9000,
+                    replication_state: "connected".to_string(),
+                    data_received: 3167038,
+                },
+            ),
+            (
+                Value::Array(vec![
+                    Value::BulkString("sentinel".into()),
+                    Value::Array(vec![
+                        Value::BulkString("resque-master".into()),
+                        Value::BulkString("html-fragments-master".into()),
+                        Value::BulkString("stats-master".into()),
+                        Value::BulkString("metadata-master".into()),
+                    ]),
+                ]),
+                Role::Sentinel {
+                    primary_names: vec![
+                        "resque-master".to_string(),
+                        "html-fragments-master".to_string(),
+                        "stats-master".to_string(),
+                        "metadata-master".to_string(),
+                    ],
+                },
+            ),
+        ];
+
+        for parse_mode in &parse_models {
+            for (value, expected) in test_cases.clone() {
+                let parsed: Role = parse_mode.parse_redis_value(value).unwrap();
+                assert_eq!(parsed, expected);
+            }
         }
     }
 
@@ -333,6 +462,86 @@ mod types {
             let v: Result<Hm, _> =
                 parse_mode.parse_redis_value(Value::Array(vec![Value::BulkString("a".into())]));
             assert_eq!(v.unwrap_err().kind(), ErrorKind::TypeError);
+        }
+    }
+
+    #[cfg(feature = "hashbrown")]
+    #[test]
+    fn test_hashbrown_hashmap() {
+        use fnv::FnvHasher;
+        use hashbrown::HashMap;
+        use std::hash::BuildHasherDefault;
+
+        type Hm = HashMap<String, i32>;
+
+        let test_arr = vec![
+            Value::BulkString("a".into()),
+            Value::BulkString("1".into()),
+            Value::BulkString("b".into()),
+            Value::BulkString("2".into()),
+            Value::BulkString("c".into()),
+            Value::BulkString("3".into()),
+        ];
+        for parse_mode in [RedisParseMode::Owned, RedisParseMode::Ref] {
+            let v: Result<Hm, _> = parse_mode.parse_redis_value(Value::Array(test_arr.clone()));
+            let mut e: Hm = HashMap::new();
+            e.insert("a".into(), 1);
+            e.insert("b".into(), 2);
+            e.insert("c".into(), 3);
+            assert_eq!(v, Ok(e));
+
+            type Hasher = BuildHasherDefault<FnvHasher>;
+            type HmHasher = HashMap<String, i32, Hasher>;
+            let v: Result<HmHasher, _> =
+                parse_mode.parse_redis_value(Value::Array(test_arr.clone()));
+
+            let fnv = Hasher::default();
+            let mut e: HmHasher = HashMap::with_hasher(fnv);
+            e.insert("a".into(), 1);
+            e.insert("b".into(), 2);
+            e.insert("c".into(), 3);
+            assert_eq!(v, Ok(e));
+
+            let v: Result<Hm, _> =
+                parse_mode.parse_redis_value(Value::Array(vec![Value::BulkString("a".into())]));
+            assert_eq!(v.unwrap_err().kind(), ErrorKind::TypeError);
+        }
+    }
+
+    #[cfg(feature = "hashbrown")]
+    #[test]
+    fn test_hashbrown_hashset() {
+        use hashbrown::HashSet;
+
+        for parse_mode in [RedisParseMode::Owned, RedisParseMode::Ref] {
+            let v: Result<HashSet<String>, _> = parse_mode.parse_redis_value(Value::Array(vec![
+                Value::BulkString("a".into()),
+                Value::BulkString("b".into()),
+                Value::BulkString("c".into()),
+            ]));
+
+            let mut expected = HashSet::new();
+            expected.insert("a".to_string());
+            expected.insert("b".to_string());
+            expected.insert("c".to_string());
+
+            assert_eq!(v, Ok(expected));
+
+            let v: Result<HashSet<i32>, _> = parse_mode.parse_redis_value(Value::Int(42));
+            assert_eq!(v.unwrap_err().kind(), ErrorKind::TypeError);
+
+            let mut set = HashSet::new();
+            set.insert("x".to_string());
+            set.insert("y".to_string());
+            set.insert("z".to_string());
+
+            let args = set.to_redis_args();
+            assert_eq!(args.len(), 3);
+
+            let args_set: HashSet<Vec<u8>> = args.into_iter().collect();
+            assert!(args_set.contains(&b"x"[..].to_vec()));
+            assert!(args_set.contains(&b"y"[..].to_vec()));
+            assert!(args_set.contains(&b"z"[..].to_vec()));
         }
     }
 
@@ -679,6 +888,124 @@ mod types {
                     }
                 ])
             )
+        }
+    }
+
+    #[test]
+    fn test_complex_nested_tuples() {
+        for parse_mode in [RedisParseMode::Owned, RedisParseMode::Ref] {
+            let value = Value::Array(vec![
+                Value::Array(vec![
+                    Value::BulkString(b"Hi1".to_vec()),
+                    Value::BulkString(b"Bye1".to_vec()),
+                    Value::BulkString(b"Hi2".to_vec()),
+                    Value::BulkString(b"Bye2".to_vec()),
+                ]),
+                Value::Array(vec![
+                    Value::BulkString(b"S1".to_vec()),
+                    Value::BulkString(b"S2".to_vec()),
+                    Value::BulkString(b"S3".to_vec()),
+                ]),
+                Value::Array(vec![
+                    Value::BulkString(b"Hi3".to_vec()),
+                    Value::BulkString(b"Bye3".to_vec()),
+                    Value::BulkString(b"Hi4".to_vec()),
+                    Value::BulkString(b"Bye4".to_vec()),
+                ]),
+                Value::Array(vec![
+                    Value::BulkString(b"S4".to_vec()),
+                    Value::BulkString(b"S5".to_vec()),
+                    Value::BulkString(b"S6".to_vec()),
+                ]),
+            ]);
+            let res: Vec<(HashMap<String, String>, Vec<String>)> =
+                parse_mode.parse_redis_value(value).unwrap();
+
+            let mut expected_map1 = HashMap::new();
+            expected_map1.insert("Hi1".to_string(), "Bye1".to_string());
+            expected_map1.insert("Hi2".to_string(), "Bye2".to_string());
+
+            let mut expected_map2 = HashMap::new();
+            expected_map2.insert("Hi3".to_string(), "Bye3".to_string());
+            expected_map2.insert("Hi4".to_string(), "Bye4".to_string());
+
+            assert_eq!(
+                res,
+                vec![
+                    (
+                        expected_map1,
+                        vec!["S1".to_string(), "S2".to_string(), "S3".to_string()]
+                    ),
+                    (
+                        expected_map2,
+                        vec!["S4".to_string(), "S5".to_string(), "S6".to_string()]
+                    )
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_complex_nested_tuples_resp3() {
+        for parse_mode in [RedisParseMode::Owned, RedisParseMode::Ref] {
+            let value = Value::Array(vec![
+                Value::Map(vec![
+                    (
+                        Value::BulkString(b"Hi1".to_vec()),
+                        Value::BulkString(b"Bye1".to_vec()),
+                    ),
+                    (
+                        Value::BulkString(b"Hi2".to_vec()),
+                        Value::BulkString(b"Bye2".to_vec()),
+                    ),
+                ]),
+                Value::Set(vec![
+                    Value::BulkString(b"S1".to_vec()),
+                    Value::BulkString(b"S2".to_vec()),
+                    Value::BulkString(b"S3".to_vec()),
+                ]),
+                Value::Map(vec![
+                    (
+                        Value::BulkString(b"Hi3".to_vec()),
+                        Value::BulkString(b"Bye3".to_vec()),
+                    ),
+                    (
+                        Value::BulkString(b"Hi4".to_vec()),
+                        Value::BulkString(b"Bye4".to_vec()),
+                    ),
+                ]),
+                Value::Set(vec![
+                    Value::BulkString(b"S4".to_vec()),
+                    Value::BulkString(b"S5".to_vec()),
+                    Value::BulkString(b"S6".to_vec()),
+                ]),
+            ]);
+            let res: Vec<(HashMap<String, String>, HashSet<String>)> =
+                parse_mode.parse_redis_value(value).unwrap();
+
+            let mut expected_map1 = HashMap::new();
+            expected_map1.insert("Hi1".to_string(), "Bye1".to_string());
+            expected_map1.insert("Hi2".to_string(), "Bye2".to_string());
+            let mut expected_set1 = HashSet::new();
+            expected_set1.insert("S1".to_string());
+            expected_set1.insert("S2".to_string());
+            expected_set1.insert("S3".to_string());
+
+            let mut expected_map2 = HashMap::new();
+            expected_map2.insert("Hi3".to_string(), "Bye3".to_string());
+            expected_map2.insert("Hi4".to_string(), "Bye4".to_string());
+            let mut expected_set2 = HashSet::new();
+            expected_set2.insert("S4".to_string());
+            expected_set2.insert("S5".to_string());
+            expected_set2.insert("S6".to_string());
+
+            assert_eq!(
+                res,
+                vec![
+                    (expected_map1, expected_set1),
+                    (expected_map2, expected_set2)
+                ]
+            );
         }
     }
 }

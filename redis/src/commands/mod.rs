@@ -2,8 +2,8 @@ use crate::cmd::{cmd, Cmd, Iter};
 use crate::connection::{Connection, ConnectionLike, Msg};
 use crate::pipeline::Pipeline;
 use crate::types::{
-    ExistenceCheck, ExpireOption, Expiry, FromRedisValue, NumericBehavior, RedisResult, RedisWrite,
-    SetExpiry, ToRedisArgs,
+    ExistenceCheck, ExpireOption, Expiry, FieldExistenceCheck, FromRedisValue, NumericBehavior,
+    RedisResult, RedisWrite, SetExpiry, ToRedisArgs,
 };
 
 #[macro_use]
@@ -32,7 +32,7 @@ use crate::streams;
 use crate::acl;
 use crate::RedisConnectionInfo;
 
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "cache-aio"))]
 pub(crate) fn is_readonly_cmd(cmd: &[u8]) -> bool {
     matches!(
         cmd,
@@ -130,6 +130,8 @@ pub(crate) fn is_readonly_cmd(cmd: &[u8]) -> bool {
             | b"ZSCAN"
             | b"ZSCORE"
             | b"ZUNION"
+            | b"JSON.GET"
+            | b"JSON.MGET"
     )
 }
 
@@ -244,12 +246,12 @@ implement_commands! {
         cmd("PEXPIREAT").arg(key).arg(ts)
     }
 
-    /// Get the time to live for a key in seconds.
+    /// Get the absolute Unix expiration timestamp in seconds.
     fn expire_time<K: ToRedisArgs>(key: K) {
         cmd("EXPIRETIME").arg(key)
-        }
+    }
 
-    /// Get the time to live for a key in milliseconds.
+    /// Get the absolute Unix expiration timestamp in milliseconds.
     fn pexpire_time<K: ToRedisArgs>(key: K) {
         cmd("PEXPIRETIME").arg(key)
     }
@@ -259,27 +261,19 @@ implement_commands! {
         cmd("PERSIST").arg(key)
     }
 
-    /// Get the expiration time of a key.
+    /// Get the time to live for a key in seconds.
     fn ttl<K: ToRedisArgs>(key: K) {
         cmd("TTL").arg(key)
     }
 
-    /// Get the expiration time of a key in milliseconds.
+    /// Get the time to live for a key in milliseconds.
     fn pttl<K: ToRedisArgs>(key: K) {
         cmd("PTTL").arg(key)
     }
 
     /// Get the value of a key and set expiration
     fn get_ex<K: ToRedisArgs>(key: K, expire_at: Expiry) {
-        let (option, time_arg) = match expire_at {
-            Expiry::EX(sec) => ("EX", Some(sec)),
-            Expiry::PX(ms) => ("PX", Some(ms)),
-            Expiry::EXAT(timestamp_sec) => ("EXAT", Some(timestamp_sec)),
-            Expiry::PXAT(timestamp_ms) => ("PXAT", Some(timestamp_ms)),
-            Expiry::PERSIST => ("PERSIST", None),
-        };
-
-        cmd("GETEX").arg(key).arg(option).arg(time_arg)
+        cmd("GETEX").arg(key).arg(expire_at)
     }
 
     /// Get the value of a key and delete it
@@ -380,9 +374,19 @@ implement_commands! {
         cmd(if field.num_of_args() <= 1 { "HGET" } else { "HMGET" }).arg(key).arg(field)
     }
 
+    /// Get the value of one or more fields of a given hash key, and optionally set their expiration
+    fn hget_ex<K: ToRedisArgs, F: ToRedisArgs>(key: K, fields: F, expire_at: Expiry) {
+        cmd("HGETEX").arg(key).arg(expire_at).arg("FIELDS").arg(fields.num_of_args()).arg(fields)
+    }
+
     /// Deletes a single (or multiple) fields from a hash.
     fn hdel<K: ToRedisArgs, F: ToRedisArgs>(key: K, field: F) {
         cmd("HDEL").arg(key).arg(field)
+    }
+
+    /// Get and delete the value of one or more fields of a given hash key
+    fn hget_del<K: ToRedisArgs, F: ToRedisArgs>(key: K, fields: F) {
+        cmd("HGETDEL").arg(key).arg("FIELDS").arg(fields.num_of_args()).arg(fields)
     }
 
     /// Sets a single field in a hash.
@@ -390,12 +394,17 @@ implement_commands! {
         cmd("HSET").arg(key).arg(field).arg(value)
     }
 
+    /// Set the value of one or more fields of a given hash key, and optionally set their expiration
+    fn hset_ex<K: ToRedisArgs, F: ToRedisArgs, V: ToRedisArgs>(key: K, hash_field_expiration_options: &'a HashFieldExpirationOptions, fields_values: &'a [(F, V)]) {
+        cmd("HSETEX").arg(key).arg(hash_field_expiration_options).arg("FIELDS").arg(fields_values.len()).arg(fields_values)
+    }
+
     /// Sets a single field in a hash if it does not exist.
     fn hset_nx<K: ToRedisArgs, F: ToRedisArgs, V: ToRedisArgs>(key: K, field: F, value: V) {
         cmd("HSETNX").arg(key).arg(field).arg(value)
     }
 
-    /// Sets a multiple fields in a hash.
+    /// Sets multiple fields in a hash.
     fn hset_multiple<K: ToRedisArgs, F: ToRedisArgs, V: ToRedisArgs>(key: K, items: &'a [(F, V)]) {
         cmd("HMSET").arg(key).arg(items)
     }
@@ -414,17 +423,17 @@ implement_commands! {
         cmd("HEXISTS").arg(key).arg(field)
     }
 
-    /// Get one or more fields TTL in seconds.
+    /// Get one or more fields' TTL in seconds.
     fn httl<K: ToRedisArgs, F: ToRedisArgs>(key: K, fields: F) {
         cmd("HTTL").arg(key).arg("FIELDS").arg(fields.num_of_args()).arg(fields)
     }
 
-    /// Get one or more fields TTL in milliseconds.
+    /// Get one or more fields' TTL in milliseconds.
     fn hpttl<K: ToRedisArgs, F: ToRedisArgs>(key: K, fields: F) {
         cmd("HPTTL").arg(key).arg("FIELDS").arg(fields.num_of_args()).arg(fields)
     }
 
-    /// Set one or more fields time to live in seconds.
+    /// Set one or more fields' time to live in seconds.
     fn hexpire<K: ToRedisArgs, F: ToRedisArgs>(key: K, seconds: i64, opt: ExpireOption, fields: F) {
        cmd("HEXPIRE").arg(key).arg(seconds).arg(opt).arg("FIELDS").arg(fields.num_of_args()).arg(fields)
     }
@@ -444,7 +453,7 @@ implement_commands! {
         cmd("HPERSIST").arg(key).arg("FIELDS").arg(fields.num_of_args()).arg(fields)
     }
 
-    /// Set one or more fields time to live in milliseconds.
+    /// Set one or more fields' time to live in milliseconds.
     fn hpexpire<K: ToRedisArgs, F: ToRedisArgs>(key: K, milliseconds: i64, opt: ExpireOption, fields: F) {
         cmd("HPEXPIRE").arg(key).arg(milliseconds).arg(opt).arg("FIELDS").arg(fields.num_of_args()).arg(fields)
     }
@@ -585,6 +594,16 @@ implement_commands! {
     /// Sets the list element at index to value
     fn lset<K: ToRedisArgs, V: ToRedisArgs>(key: K, index: isize, value: V) {
         cmd("LSET").arg(key).arg(index).arg(value)
+    }
+
+    /// Sends a ping to the server
+    fn ping<>() {
+         &mut cmd("PING")
+    }
+
+    /// Sends a ping with a message to the server
+    fn ping_message<K: ToRedisArgs>(message: K) {
+         cmd("PING").arg(message)
     }
 
     /// Removes and returns the up to `count` last elements of the list stored at key
@@ -1022,6 +1041,11 @@ implement_commands! {
         cmd("PUBLISH").arg(channel).arg(message)
     }
 
+    /// Posts a message to the given sharded channel.
+    fn spublish<K: ToRedisArgs, E: ToRedisArgs>(channel: K, message: E) {
+        cmd("SPUBLISH").arg(channel).arg(message)
+    }
+
     // Object commands
 
     /// Returns the encoding of a key.
@@ -1042,6 +1066,21 @@ implement_commands! {
     /// Returns the reference count of a key.
     fn object_refcount<K: ToRedisArgs>(key: K) {
         cmd("OBJECT").arg("REFCOUNT").arg(key)
+    }
+
+    /// Returns the name of the current connection as set by CLIENT SETNAME.
+    fn client_getname<>() {
+        cmd("CLIENT").arg("GETNAME")
+    }
+
+    /// Returns the ID of the current connection.
+    fn client_id<>() {
+        cmd("CLIENT").arg("ID")
+    }
+
+    /// Command assigns a name to the current connection.
+    fn client_setname<K: ToRedisArgs>(connection_name: K) {
+        cmd("CLIENT").arg("SETNAME").arg(connection_name)
     }
 
     // ACL commands
@@ -1107,6 +1146,13 @@ implement_commands! {
     #[cfg_attr(docsrs, doc(cfg(feature = "acl")))]
     fn acl_deluser<K: ToRedisArgs>(usernames: &'a [K]) {
         cmd("ACL").arg("DELUSER").arg(usernames)
+    }
+
+    /// Simulate the execution of a given command by a given user.
+    #[cfg(feature = "acl")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "acl")))]
+    fn acl_dryrun<K: ToRedisArgs, C: ToRedisArgs, A: ToRedisArgs>(username: K, command: C, args: A) {
+        cmd("ACL").arg("DRYRUN").arg(username).arg(command).arg(args)
     }
 
     /// Shows the available ACL categories.
@@ -1420,6 +1466,42 @@ implement_commands! {
         cmd("XADD").arg(key).arg(id).arg(map)
     }
 
+
+    /// Add a stream message with options.
+    ///
+    /// Items can be any list type, e.g.
+    /// ```rust
+    /// // static items
+    /// let items = &[("key", "val"), ("key2", "val2")];
+    /// # use std::collections::BTreeMap;
+    /// // A map (Can be BTreeMap, HashMap, etc)
+    /// let mut map: BTreeMap<&str, &str> = BTreeMap::new();
+    /// map.insert("ab", "cd");
+    /// map.insert("ef", "gh");
+    /// map.insert("ij", "kl");
+    /// ```
+    ///
+    /// ```text
+    /// XADD key [NOMKSTREAM] [<MAXLEN|MINID> [~|=] threshold [LIMIT count]] <* | ID> field value [field value] ...
+    /// ```
+    #[cfg(feature = "streams")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "streams")))]
+    fn xadd_options<
+        K: ToRedisArgs, ID: ToRedisArgs, I: ToRedisArgs
+    >(
+        key: K,
+        id: ID,
+        items: I,
+        options: &'a streams::StreamAddOptions
+    ) {
+        cmd("XADD")
+            .arg(key)
+            .arg(options)
+            .arg(id)
+            .arg(items)
+    }
+
+
     /// Add a stream message while capping the stream at a maxlength.
     ///
     /// ```text
@@ -1563,7 +1645,7 @@ implement_commands! {
     /// ```text
     /// XCLAIM <key> <group> <consumer> <min-idle-time> <ID-1> <ID-2>
     ///     [IDLE <milliseconds>] [TIME <mstime>] [RETRYCOUNT <count>]
-    ///     [FORCE] [JUSTID]
+    ///     [FORCE] [JUSTID] [LASTID <lastid>]
     /// ```
     #[cfg(feature = "streams")]
     #[cfg_attr(docsrs, doc(cfg(feature = "streams")))]
@@ -2085,9 +2167,27 @@ implement_commands! {
         cmd("XTRIM").arg(key).arg(maxlen)
     }
 
+     /// Trim a stream `key` with full options
+     ///
+     /// ```text
+     /// XTRIM <key> <MAXLEN|MINID> [~|=] <threshold> [LIMIT <count>]  (Same as XADD MAXID|MINID options)
+     /// ```
+    #[cfg(feature = "streams")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "streams")))]
+    fn xtrim_options<K: ToRedisArgs>(
+        key: K,
+        options: &'a streams::StreamTrimOptions
+    ) {
+        cmd("XTRIM").arg(key).arg(options)
+    }
+
     // script commands
 
     /// Adds a prepared script command to the pipeline.
+    ///
+    /// Note: unlike a call to [`invoke`](crate::ScriptInvocation::invoke), if the script isn't loaded during the pipeline operation,
+    /// it will not automatically be loaded and retried. The script can be loaded using the
+    /// [`load`](crate::ScriptInvocation::load) operation.
     #[cfg_attr(feature = "script", doc = r##"
 
 # Examples:
@@ -2099,6 +2199,7 @@ implement_commands! {
 let script = redis::Script::new(r"
     return tonumber(ARGV[1]) + tonumber(ARGV[2]);
 ");
+script.prepare_invoke().load(&mut con)?;
 let (a, b): (isize, isize) = redis::pipe()
     .invoke_script(script.arg(1).arg(2))
     .invoke_script(script.arg(2).arg(3))
@@ -2113,6 +2214,54 @@ assert_eq!(b, 5);
     #[cfg_attr(docsrs, doc(cfg(feature = "script")))]
     fn invoke_script<>(invocation: &'a crate::ScriptInvocation<'a>) {
         &mut invocation.eval_cmd()
+    }
+
+    // cleanup commands
+
+    /// Deletes all the keys of all databases
+    ///
+    /// Whether the flushing happens asynchronously or synchronously depends on the configuration
+    /// of your Redis server.
+    ///
+    /// To enforce a flush mode, use [`Commands::flushall_options`].
+    ///
+    /// ```text
+    /// FLUSHALL
+    /// ```
+    fn flushall<>() {
+        &mut cmd("FLUSHALL")
+    }
+
+    /// Deletes all the keys of all databases with options
+    ///
+    /// ```text
+    /// FLUSHALL [ASYNC|SYNC]
+    /// ```
+    fn flushall_options<>(options: &'a FlushAllOptions) {
+        cmd("FLUSHALL").arg(options)
+    }
+
+    /// Deletes all the keys of the current database
+    ///
+    /// Whether the flushing happens asynchronously or synchronously depends on the configuration
+    /// of your Redis server.
+    ///
+    /// To enforce a flush mode, use [`Commands::flushdb_options`].
+    ///
+    /// ```text
+    /// FLUSHDB
+    /// ```
+    fn flushdb<>() {
+        &mut cmd("FLUSHDB")
+    }
+
+    /// Deletes all the keys of the current database with options
+    ///
+    /// ```text
+    /// FLUSHDB [ASYNC|SYNC]
+    /// ```
+    fn flushdb_options<>(options: &'a FlushDbOptions) {
+        cmd("FLUSHDB").arg(options)
     }
 }
 
@@ -2187,7 +2336,7 @@ pub trait PubSubCommands: Sized {
 impl<T> Commands for T where T: ConnectionLike {}
 
 #[cfg(feature = "aio")]
-impl<T> AsyncCommands for T where T: crate::aio::ConnectionLike + Send + Sized {}
+impl<T> AsyncCommands for T where T: crate::aio::ConnectionLike + Send + Sync + Sized {}
 
 impl PubSubCommands for Connection {
     fn subscribe<C, F, U>(&mut self, channels: C, mut func: F) -> RedisResult<U>
@@ -2246,6 +2395,7 @@ impl PubSubCommands for Connection {
 pub struct ScanOptions {
     pattern: Option<String>,
     count: Option<usize>,
+    scan_type: Option<String>,
 }
 
 impl ScanOptions {
@@ -2258,6 +2408,12 @@ impl ScanOptions {
     /// Pattern for scan
     pub fn with_pattern(mut self, p: impl Into<String>) -> Self {
         self.pattern = Some(p.into());
+        self
+    }
+
+    /// Limit the results to those with the given Redis type
+    pub fn with_type(mut self, t: impl Into<String>) -> Self {
+        self.scan_type = Some(t.into());
         self
     }
 }
@@ -2276,6 +2432,11 @@ impl ToRedisArgs for ScanOptions {
             out.write_arg(b"COUNT");
             out.write_arg_fmt(n);
         }
+
+        if let Some(t) = &self.scan_type {
+            out.write_arg(b"TYPE");
+            out.write_arg_fmt(t);
+        }
     }
 
     fn num_of_args(&self) -> usize {
@@ -2284,6 +2445,9 @@ impl ToRedisArgs for ScanOptions {
             len += 2;
         }
         if self.count.is_some() {
+            len += 2;
+        }
+        if self.scan_type.is_some() {
             len += 2;
         }
         len
@@ -2483,19 +2647,147 @@ impl ToRedisArgs for SetOptions {
     }
 }
 
+/// Options for the [FLUSHALL](https://redis.io/commands/flushall) command
+///
+/// # Example
+/// ```rust,no_run
+/// use redis::{Commands, RedisResult, FlushAllOptions};
+/// fn flushall_sync(
+///     con: &mut redis::Connection,
+/// ) -> RedisResult<()> {
+///     let opts = FlushAllOptions{blocking: true};
+///     con.flushall_options(&opts)
+/// }
+/// ```
+#[derive(Clone, Copy, Default)]
+pub struct FlushAllOptions {
+    /// Blocking (`SYNC`) waits for completion, non-blocking (`ASYNC`) runs in the background
+    pub blocking: bool,
+}
+
+impl FlushAllOptions {
+    /// Set whether to run blocking (`SYNC`) or non-blocking (`ASYNC`) flush
+    pub fn blocking(mut self, blocking: bool) -> Self {
+        self.blocking = blocking;
+        self
+    }
+}
+
+impl ToRedisArgs for FlushAllOptions {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        if self.blocking {
+            out.write_arg(b"SYNC");
+        } else {
+            out.write_arg(b"ASYNC");
+        };
+    }
+}
+
+/// Options for the [FLUSHDB](https://redis.io/commands/flushdb) command
+pub type FlushDbOptions = FlushAllOptions;
+
+/// Options for the HSETEX command
+#[derive(Clone, Copy, Default)]
+pub struct HashFieldExpirationOptions {
+    existence_check: Option<FieldExistenceCheck>,
+    expiration: Option<SetExpiry>,
+}
+
+impl HashFieldExpirationOptions {
+    /// Set the field(s) existence check for the HSETEX command
+    pub fn set_existence_check(mut self, field_existence_check: FieldExistenceCheck) -> Self {
+        self.existence_check = Some(field_existence_check);
+        self
+    }
+
+    /// Set the expiration option for the field(s) in the HSETEX command
+    pub fn set_expiration(mut self, expiration: SetExpiry) -> Self {
+        self.expiration = Some(expiration);
+        self
+    }
+}
+
+impl ToRedisArgs for HashFieldExpirationOptions {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        if let Some(ref existence_check) = self.existence_check {
+            match existence_check {
+                FieldExistenceCheck::FNX => out.write_arg(b"FNX"),
+                FieldExistenceCheck::FXX => out.write_arg(b"FXX"),
+            }
+        }
+
+        if let Some(ref expiration) = self.expiration {
+            match expiration {
+                SetExpiry::EX(secs) => {
+                    out.write_arg(b"EX");
+                    out.write_arg(format!("{}", secs).as_bytes());
+                }
+                SetExpiry::PX(millis) => {
+                    out.write_arg(b"PX");
+                    out.write_arg(format!("{}", millis).as_bytes());
+                }
+                SetExpiry::EXAT(unix_time) => {
+                    out.write_arg(b"EXAT");
+                    out.write_arg(format!("{}", unix_time).as_bytes());
+                }
+                SetExpiry::PXAT(unix_time) => {
+                    out.write_arg(b"PXAT");
+                    out.write_arg(format!("{}", unix_time).as_bytes());
+                }
+                SetExpiry::KEEPTTL => {
+                    out.write_arg(b"KEEPTTL");
+                }
+            }
+        }
+    }
+}
+
+impl ToRedisArgs for Expiry {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + RedisWrite,
+    {
+        match self {
+            Expiry::EX(sec) => {
+                out.write_arg(b"EX");
+                out.write_arg(sec.to_string().as_bytes());
+            }
+            Expiry::PX(ms) => {
+                out.write_arg(b"PX");
+                out.write_arg(ms.to_string().as_bytes());
+            }
+            Expiry::EXAT(timestamp_sec) => {
+                out.write_arg(b"EXAT");
+                out.write_arg(timestamp_sec.to_string().as_bytes());
+            }
+            Expiry::PXAT(timestamp_ms) => {
+                out.write_arg(b"PXAT");
+                out.write_arg(timestamp_ms.to_string().as_bytes());
+            }
+            Expiry::PERSIST => {
+                out.write_arg(b"PERSIST");
+            }
+        }
+    }
+}
+
 /// Creates HELLO command for RESP3 with RedisConnectionInfo
 pub fn resp3_hello(connection_info: &RedisConnectionInfo) -> Cmd {
     let mut hello_cmd = cmd("HELLO");
     hello_cmd.arg("3");
-    if connection_info.password.is_some() {
+    if let Some(password) = &connection_info.password {
         let username: &str = match connection_info.username.as_ref() {
             None => "default",
             Some(username) => username,
         };
-        hello_cmd
-            .arg("AUTH")
-            .arg(username)
-            .arg(connection_info.password.as_ref().unwrap());
+        hello_cmd.arg("AUTH").arg(username).arg(password);
     }
+
     hello_cmd
 }

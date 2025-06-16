@@ -1,4 +1,4 @@
-//! redis-rs is a Rust implementation of a Redis client library.  It exposes
+//! redis-rs is a Rust implementation of a client library for Redis.  It exposes
 //! a general purpose interface to Redis and also provides specific helpers for
 //! commonly used functionality.
 //!
@@ -24,6 +24,20 @@
 //! part of the API allows you to express any request on the redis level.
 //! You can fluently switch between both API levels at any point.
 //!
+//! # TLS / SSL
+//!
+//! The user can enable TLS support using either RusTLS or native support (usually OpenSSL),
+//! using the `tls-rustls` or `tls-native-tls` features respectively. In order to enable TLS
+//! for async usage, the user must enable matching features for their runtime - either `tokio-native-tls-comp`,
+//! `tokio-rustls-comp`, `async-std-native-tls-comp`, or `async-std-rustls-comp`. Additionally, the
+//! `tls-rustls-webpki-roots` allows usage of of webpki-roots for the root certificate store.
+//!
+//! # TCP settings
+//!
+//! The user can set parameters of the underlying TCP connection by using the `tcp_nodelay` and `keep-alive` features.
+//! Alternatively, users of async connections can set [crate::io::tcp::TcpSettings] on the connection configuration objects,
+//! and set the TCP parameters in a more specific manner there.
+//!
 //! ## Connection Handling
 //!
 //! For connecting to redis you can use a client object which then can produce
@@ -47,13 +61,39 @@
 //! }
 //! ```
 //!
+//! ## Connection Pooling
+//!
+//! When using a sync connection, it is recommended to use a connection pool in order to handle
+//! disconnects or multi-threaded usage. This can be done using the `r2d2` feature.
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "r2d2")]
+//! # fn do_something() {
+//! use redis::Commands;
+//!
+//! let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+//! let pool = r2d2::Pool::builder().build(client).unwrap();
+//! let mut conn = pool.get().unwrap();
+//!
+//! let _: () = conn.set("KEY", "VALUE").unwrap();
+//! let val: String = conn.get("KEY").unwrap();
+//! # }
+//! ```
+//!
+//! For async connections, connection pooling isn't necessary. The `MultiplexedConnection` is
+//! cloneable and can be used safely from multiple threads, so a single connection can be easily
+//! reused. For automatic reconnections consider using `ConnectionManager` with the `connection-manager` feature.
+//! Async cluster connections also don't require pooling and are thread-safe and reusable.
+//!
 //! ## Optional Features
 //!
 //! There are a few features defined that can enable additional functionality
 //! if so desired.  Some of them are turned on by default.
 //!
 //! * `acl`: enables acl support (enabled by default)
-//! * `aio`: enables async IO support (optional)
+//! * `tokio-comp`: enables support for async usage with the Tokio runtime (optional)
+//! * `async-std-comp`: enables support for async usage with any runtime which is async-std compliant. (optional)
+//! * `smol-comp`: enables support for async usage with the Smol runtime (optional)
 //! * `geospatial`: enables geospatial support (enabled by default)
 //! * `script`: enables script support (enabled by default)
 //! * `streams`: enables high-level interface for interaction with Redis streams (enabled by default)
@@ -61,13 +101,15 @@
 //! * `ahash`: enables ahash map/set support & uses ahash internally (+7-10% performance) (optional)
 //! * `cluster`: enables redis cluster support (optional)
 //! * `cluster-async`: enables async redis cluster support (optional)
-//! * `tokio-comp`: enables support for tokio (optional)
 //! * `connection-manager`: enables support for automatic reconnection (optional)
 //! * `keep-alive`: enables keep-alive option on socket by means of `socket2` crate (enabled by default)
 //! * `tcp_nodelay`: enables the no-delay flag on  communication sockets (optional)
 //! * `rust_decimal`, `bigdecimal`, `num-bigint`: enables type conversions to large number representation from different crates (optional)
 //! * `uuid`: enables type conversion to UUID (optional)
 //! * `sentinel`: enables high-level interfaces for communication with Redis sentinels (optional)
+//! * `json`: enables high-level interfaces for communication with the JSON module (optional)
+//! * `cache-aio`: enables **experimental** client side caching for MultiplexedConnection (optional)
+//! * `disable-client-setinfo`: disables the `CLIENT SETINFO` handshake during connection initialization
 //!
 //! ## Connection Parameters
 //!
@@ -85,7 +127,7 @@
 //!
 //! `redis+unix:///<path>[?db=<db>[&pass=<password>][&user=<username>][&protocol=<protocol>]]`
 //!
-//! For compatibility with some other redis libraries, the "unix" scheme
+//! For compatibility with some other libraries for Redis, the "unix" scheme
 //! is also supported:
 //!
 //! `unix:///<path>[?db=<db>][&pass=<password>][&user=<username>][&protocol=<protocol>]]`
@@ -281,10 +323,8 @@
 //!
 //! # PubSub
 //!
-//! Pubsub is currently work in progress but provided through the `PubSub`
-//! connection object.  Due to the fact that Rust does not have support
-//! for async IO in libnative yet, the API does not provide a way to
-//! read messages with any form of timeout yet.
+//! Pubsub is provided through the `PubSub` connection object for sync usage, or the `aio::PubSub`
+//! for async usage.
 //!
 //! Example usage:
 //!
@@ -293,8 +333,7 @@
 //! let client = redis::Client::open("redis://127.0.0.1/")?;
 //! let mut con = client.get_connection()?;
 //! let mut pubsub = con.as_pubsub();
-//! pubsub.subscribe("channel_1")?;
-//! pubsub.subscribe("channel_2")?;
+//! pubsub.subscribe(&["channel_1", "channel_2"])?;
 //!
 //! loop {
 //!     let msg = pubsub.get_message()?;
@@ -302,6 +341,24 @@
 //!     println!("channel '{}': {}", msg.get_channel_name(), payload);
 //! }
 //! # }
+//! ```
+//! In order to update subscriptions while concurrently waiting for messages, the async PubSub can be split into separate sink & stream components. The sink can be receive subscription requests while the stream is awaited for messages.
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "aio")]
+//! use futures_util::StreamExt;
+//! # #[cfg(feature = "aio")]
+//! # async fn do_something() -> redis::RedisResult<()> {
+//! let client = redis::Client::open("redis://127.0.0.1/")?;
+//! let (mut sink, mut stream) = client.get_async_pubsub().await?.split();
+//! sink.subscribe("channel_1").await?;
+//!
+//! loop {
+//!     let msg = stream.next().await.unwrap();
+//!     let payload : String = msg.get_payload().unwrap();
+//!     println!("channel '{}': {}", msg.get_channel_name(), payload);
+//! }
+//! # Ok(()) }
 //! ```
 //!
 //! ## RESP3 async pubsub
@@ -319,8 +376,7 @@
 //! let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 //! let config = redis::AsyncConnectionConfig::new().set_push_sender(tx);
 //! let mut con = client.get_multiplexed_async_connection_with_config(&config).await?;
-//! con.subscribe("channel_1").await?;
-//! con.subscribe("channel_2").await?;
+//! con.subscribe(&["channel_1", "channel_2"]).await?;
 //!
 //! loop {
 //!   println!("Received {:?}", rx.recv().await.unwrap());
@@ -371,7 +427,7 @@ assert_eq!(b, 5);
 ```
 
 Note: unlike a call to [`invoke`](ScriptInvocation::invoke), if the script isn't loaded during the pipeline operation,
-it will not automatically be loaded and retried. The script can be loaded using the 
+it will not automatically be loaded and retried. The script can be loaded using the
 [`load`](ScriptInvocation::load) operation.
 "##
 )]
@@ -382,7 +438,7 @@ it will not automatically be loaded and retried. The script can be loaded using 
 # Async
 
 In addition to the synchronous interface that's been explained above there also exists an
-asynchronous interface based on [`futures`][] and [`tokio`][], or [`async-std`][].
+asynchronous interface based on [`futures`][] and [`tokio`][], [`smol`](https://docs.rs/smol/latest/smol/), or [`async-std`][].
 
 This interface exists under the `aio` (async io) module (which requires that the `aio` feature
 is enabled) and largely mirrors the synchronous with a few concessions to make it fit the
@@ -408,6 +464,14 @@ let result = redis::cmd("MGET")
 assert_eq!(result, Ok(("foo".to_string(), b"bar".to_vec())));
 # Ok(()) }
 ```
+
+## Runtime support
+The crate supports multiple runtimes, including `tokio`, `async-std`, and `smol`. For Tokio, the crate will
+spawn tasks on the current thread runtime. For async-std & smol, the crate will spawn tasks on the the global runtime.
+It is recommended that the crate be used with support only for a single runtime. If the crate is compiled with multiple runtimes,
+the user should call [`crate::aio::prefer_tokio`], [`crate::aio::prefer_async_std`] or [`crate::aio::prefer_smol`] to set the preferred runtime.
+These functions set global state which automatically chooses the correct runtime for the async connection.
+
 "##
 )]
 //!
@@ -469,15 +533,27 @@ let primary = sentinel.get_async_connection().await.unwrap();
 #![deny(non_camel_case_types)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, warn(rustdoc::broken_intra_doc_links))]
-#![cfg_attr(docsrs, feature(doc_cfg))]
+// When on docs.rs we want to show tuple variadics in the docs.
+// This currently requires internal/unstable features in Rustdoc.
+#![cfg_attr(
+    docsrs,
+    feature(doc_cfg, rustdoc_internals),
+    expect(
+        internal_features,
+        reason = "rustdoc_internals is needed for fake_variadic"
+    )
+)]
 
 // public api
 #[cfg(feature = "aio")]
 pub use crate::client::AsyncConnectionConfig;
 pub use crate::client::Client;
+#[cfg(feature = "cache-aio")]
+pub use crate::cmd::CommandCacheConfig;
 pub use crate::cmd::{cmd, pack_command, pipe, Arg, Cmd, Iter};
 pub use crate::commands::{
-    Commands, ControlFlow, Direction, LposOptions, PubSubCommands, ScanOptions, SetOptions,
+    Commands, ControlFlow, Direction, FlushAllOptions, FlushDbOptions, HashFieldExpirationOptions,
+    LposOptions, PubSubCommands, ScanOptions, SetOptions,
 };
 pub use crate::connection::{
     parse_redis_url, transaction, Connection, ConnectionAddr, ConnectionInfo, ConnectionLike,
@@ -496,9 +572,11 @@ pub use crate::types::{
     // utility functions
     from_redis_value,
     from_owned_redis_value,
+    make_extension_error,
 
     // error kinds
     ErrorKind,
+    RetryMethod,
 
     // conversion traits
     FromRedisValue,
@@ -509,7 +587,10 @@ pub use crate::types::{
     Expiry,
     SetExpiry,
     ExistenceCheck,
+    FieldExistenceCheck,
     ExpireOption,
+    Role,
+    ReplicaInfo,
 
     // error and result types
     RedisError,
@@ -554,6 +635,9 @@ pub use crate::commands::JsonAsyncCommands;
 #[cfg_attr(docsrs, doc(cfg(feature = "geospatial")))]
 pub mod geo;
 
+#[cfg(any(feature = "connection-manager", feature = "cluster-async"))]
+mod subscription_tracker;
+
 #[cfg(feature = "cluster")]
 mod cluster_topology;
 
@@ -578,6 +662,10 @@ pub mod cluster_routing;
 #[cfg_attr(docsrs, doc(cfg(feature = "r2d2")))]
 mod r2d2;
 
+#[cfg(all(feature = "bb8", feature = "aio"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "bb8", feature = "aio"))))]
+mod bb8;
+
 #[cfg(feature = "streams")]
 #[cfg_attr(docsrs, doc(cfg(feature = "streams")))]
 pub mod streams;
@@ -597,10 +685,29 @@ mod tls;
 #[cfg_attr(docsrs, doc(cfg(feature = "tls-rustls")))]
 pub use crate::tls::{ClientTlsConfig, TlsCertificates};
 
+#[cfg(feature = "cache-aio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cache-aio")))]
+pub mod caching;
+
 mod client;
 mod cmd;
 mod commands;
 mod connection;
+/// Module for defining I/O behavior.
+pub mod io;
 mod parser;
 mod script;
 mod types;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_is_send() {
+        const fn assert_send<T: Send>() {}
+
+        assert_send::<Connection>();
+        #[cfg(feature = "cluster")]
+        assert_send::<cluster::ClusterConnection>();
+    }
+}

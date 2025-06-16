@@ -1,13 +1,15 @@
+#[cfg(feature = "cluster-async")]
+use crate::aio::AsyncPushSender;
 use crate::connection::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
+#[cfg(feature = "cluster-async")]
+use crate::io::{tcp::TcpSettings, AsyncDNSResolver};
 use crate::types::{ErrorKind, ProtocolVersion, RedisError, RedisResult};
 use crate::{cluster, cluster::TlsMode};
 use rand::Rng;
+#[cfg(feature = "cluster-async")]
+use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "tls-rustls")]
-use crate::tls::TlsConnParams;
-
-#[cfg(not(feature = "tls-rustls"))]
 use crate::connection::TlsConnParams;
 
 #[cfg(feature = "cluster-async")]
@@ -27,10 +29,18 @@ struct BuilderParams {
     tls: Option<TlsMode>,
     #[cfg(feature = "tls-rustls")]
     certs: Option<TlsCertificates>,
+    #[cfg(any(feature = "tls-rustls-insecure", feature = "tls-native-tls"))]
+    danger_accept_invalid_hostnames: bool,
     retries_configuration: RetryParams,
     connection_timeout: Option<Duration>,
     response_timeout: Option<Duration>,
-    protocol: ProtocolVersion,
+    protocol: Option<ProtocolVersion>,
+    #[cfg(feature = "cluster-async")]
+    async_push_sender: Option<Arc<dyn AsyncPushSender>>,
+    #[cfg(feature = "cluster-async")]
+    pub(crate) tcp_settings: TcpSettings,
+    #[cfg(feature = "cluster-async")]
+    async_dns_resolver: Option<Arc<dyn AsyncDNSResolver>>,
 }
 
 #[derive(Clone)]
@@ -65,7 +75,7 @@ impl RetryParams {
         let clamped_wait = base_wait
             .min(self.max_wait_time)
             .max(self.min_wait_time + 1);
-        let jittered_wait = rand::thread_rng().gen_range(self.min_wait_time..clamped_wait);
+        let jittered_wait = rand::rng().random_range(self.min_wait_time..clamped_wait);
         Duration::from_millis(jittered_wait)
     }
 }
@@ -83,20 +93,41 @@ pub(crate) struct ClusterParams {
     pub(crate) retry_params: RetryParams,
     pub(crate) tls_params: Option<TlsConnParams>,
     pub(crate) connection_timeout: Duration,
-    pub(crate) response_timeout: Duration,
-    pub(crate) protocol: ProtocolVersion,
+    pub(crate) response_timeout: Option<Duration>,
+    pub(crate) protocol: Option<ProtocolVersion>,
+    #[cfg(feature = "cluster-async")]
+    pub(crate) async_push_sender: Option<Arc<dyn AsyncPushSender>>,
+    #[cfg(feature = "cluster-async")]
+    pub(crate) tcp_settings: TcpSettings,
+    #[cfg(feature = "cluster-async")]
+    pub(crate) async_dns_resolver: Option<Arc<dyn AsyncDNSResolver>>,
 }
 
 impl ClusterParams {
     fn from(value: BuilderParams) -> RedisResult<Self> {
         #[cfg(not(feature = "tls-rustls"))]
-        let tls_params = None;
+        let tls_params: Option<TlsConnParams> = None;
 
         #[cfg(feature = "tls-rustls")]
         let tls_params = {
-            let retrieved_tls_params = value.certs.clone().map(retrieve_tls_certificates);
+            let retrieved_tls_params = value.certs.as_ref().map(retrieve_tls_certificates);
 
             retrieved_tls_params.transpose()?
+        };
+
+        #[cfg(any(feature = "tls-rustls-insecure", feature = "tls-native-tls"))]
+        let tls_params = if value.danger_accept_invalid_hostnames {
+            let mut tls_params = tls_params.unwrap_or(TlsConnParams {
+                #[cfg(feature = "tls-rustls")]
+                client_tls_params: None,
+                #[cfg(feature = "tls-rustls")]
+                root_cert_store: None,
+                danger_accept_invalid_hostnames: false,
+            });
+            tls_params.danger_accept_invalid_hostnames = true;
+            Some(tls_params)
+        } else {
+            tls_params
         };
 
         Ok(Self {
@@ -107,9 +138,34 @@ impl ClusterParams {
             retry_params: value.retries_configuration,
             tls_params,
             connection_timeout: value.connection_timeout.unwrap_or(Duration::from_secs(1)),
-            response_timeout: value.response_timeout.unwrap_or(Duration::MAX),
+            response_timeout: value.response_timeout,
             protocol: value.protocol,
+            #[cfg(feature = "cluster-async")]
+            async_push_sender: value.async_push_sender,
+            #[cfg(feature = "cluster-async")]
+            tcp_settings: value.tcp_settings,
+            #[cfg(feature = "cluster-async")]
+            async_dns_resolver: value.async_dns_resolver,
         })
+    }
+
+    fn with_config(mut self, config: cluster::ClusterConfig) -> Self {
+        if let Some(connection_timeout) = config.connection_timeout {
+            self.connection_timeout = connection_timeout;
+        }
+        self.response_timeout = config.response_timeout;
+
+        #[cfg(feature = "cluster-async")]
+        if let Some(async_push_sender) = config.async_push_sender {
+            self.async_push_sender = Some(async_push_sender);
+        }
+
+        #[cfg(feature = "cluster-async")]
+        if let Some(async_dns_resolver) = config.async_dns_resolver {
+            self.async_dns_resolver = Some(async_dns_resolver);
+        }
+
+        self
     }
 }
 
@@ -177,23 +233,21 @@ impl ClusterClientBuilder {
         } else {
             &None
         };
-        if cluster_params.tls.is_none() {
-            cluster_params.tls = match first_node.addr {
-                ConnectionAddr::TcpTls {
-                    host: _,
-                    port: _,
-                    insecure,
-                    tls_params: _,
-                } => Some(match insecure {
-                    false => TlsMode::Secure,
-                    true => TlsMode::Insecure,
-                }),
-                _ => None,
-            };
-        }
+        let tls = if cluster_params.tls.is_none() {
+            cluster_params.tls = first_node.addr.tls_mode();
+            cluster_params.tls
+        } else {
+            None
+        };
+        let protocol = if cluster_params.protocol.is_none() {
+            cluster_params.protocol = Some(first_node.redis.protocol);
+            cluster_params.protocol
+        } else {
+            None
+        };
 
-        let mut nodes = Vec::with_capacity(initial_nodes.len());
-        for mut node in initial_nodes {
+        // Verify that the initial nodes match the cluster client's configuration.
+        for node in &initial_nodes {
             if let ConnectionAddr::Unix(_) = node.addr {
                 return Err(RedisError::from((ErrorKind::InvalidClientConfig,
                                              "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.")));
@@ -212,12 +266,23 @@ impl ClusterClientBuilder {
                     "Cannot use different username among initial nodes.",
                 )));
             }
-            node.redis.protocol = cluster_params.protocol;
-            nodes.push(node);
+            if protocol.is_some() && Some(node.redis.protocol) != protocol {
+                return Err(RedisError::from((
+                    ErrorKind::InvalidClientConfig,
+                    "Cannot use different protocol among initial nodes.",
+                )));
+            }
+
+            if tls.is_some() && node.addr.tls_mode() != tls {
+                return Err(RedisError::from((
+                    ErrorKind::InvalidClientConfig,
+                    "Cannot use different TLS modes among initial nodes.",
+                )));
+            }
         }
 
         Ok(ClusterClient {
-            initial_nodes: nodes,
+            initial_nodes,
             cluster_params,
         })
     }
@@ -266,6 +331,25 @@ impl ClusterClientBuilder {
     #[cfg(any(feature = "tls-native-tls", feature = "tls-rustls"))]
     pub fn tls(mut self, tls: TlsMode) -> ClusterClientBuilder {
         self.builder_params.tls = Some(tls);
+        self
+    }
+
+    /// Configure hostname verification when connecting with TLS.
+    ///
+    /// If `insecure` is true, this **disables** hostname verification, while
+    /// leaving other aspects of certificate checking enabled. This mode is
+    /// similar to what `redis-cli` does: TLS connections do check certificates,
+    /// but hostname errors are ignored.
+    ///
+    /// # Warning
+    ///
+    /// You should think very carefully before you use this method. If hostname
+    /// verification is not used, any valid certificate for any site will be
+    /// trusted for use from any other. This introduces a significant
+    /// vulnerability to man-in-the-middle attacks.
+    #[cfg(any(feature = "tls-rustls-insecure", feature = "tls-native-tls"))]
+    pub fn danger_accept_invalid_hostnames(mut self, insecure: bool) -> ClusterClientBuilder {
+        self.builder_params.danger_accept_invalid_hostnames = insecure;
         self
     }
 
@@ -322,7 +406,7 @@ impl ClusterClientBuilder {
 
     /// Sets the protocol with which the client should communicate with the server.
     pub fn use_protocol(mut self, protocol: ProtocolVersion) -> ClusterClientBuilder {
-        self.builder_params.protocol = protocol;
+        self.builder_params.protocol = Some(protocol);
         self
     }
 
@@ -338,9 +422,60 @@ impl ClusterClientBuilder {
         self.builder_params.read_from_replicas = read_from_replicas;
         self
     }
+
+    #[cfg(feature = "cluster-async")]
+    /// Sets sender sender for push values.
+    ///
+    /// The sender can be a channel, or an arbitrary function that handles [crate::PushInfo] values.
+    /// This will fail client creation if the connection isn't configured for RESP3 communications via the [crate::RedisConnectionInfo::protocol] field.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use redis::cluster::ClusterClientBuilder;
+    /// let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    /// let config = ClusterClientBuilder::new(vec!["redis://127.0.0.1:6379/"])
+    ///     .use_protocol(redis::ProtocolVersion::RESP3)
+    ///     .push_sender(tx);
+    /// ```
+    ///
+    /// ```rust
+    /// # use std::sync::{Mutex, Arc};
+    /// # use redis::cluster::ClusterClientBuilder;
+    /// let messages = Arc::new(Mutex::new(Vec::new()));
+    /// let config = ClusterClientBuilder::new(vec!["redis://127.0.0.1:6379/"])
+    ///     .use_protocol(redis::ProtocolVersion::RESP3)
+    ///     .push_sender(move |msg|{
+    ///         let Ok(mut messages) = messages.lock() else {
+    ///             return Err(redis::aio::SendError);
+    ///         };
+    ///         messages.push(msg);
+    ///         Ok(())
+    ///     });
+    /// ```
+    pub fn push_sender(mut self, push_sender: impl AsyncPushSender) -> ClusterClientBuilder {
+        self.builder_params.async_push_sender = Some(Arc::new(push_sender));
+        self
+    }
+
+    /// Set the behavior of the underlying TCP connection.
+    #[cfg(feature = "cluster-async")]
+    pub fn tcp_settings(mut self, tcp_settings: TcpSettings) -> ClusterClientBuilder {
+        self.builder_params.tcp_settings = tcp_settings;
+        self
+    }
+
+    /// Set asynchronous DNS resolver for the underlying TCP connection.
+    ///
+    /// The parameter resolver must implement the [`crate::io::AsyncDNSResolver`] trait.
+    #[cfg(feature = "cluster-async")]
+    pub fn async_dns_resolver(mut self, resolver: impl AsyncDNSResolver) -> ClusterClientBuilder {
+        self.builder_params.async_dns_resolver = Some(Arc::new(resolver));
+        self
+    }
 }
 
-/// This is a Redis Cluster client.
+/// A Redis Cluster client, used to create connections.
 #[derive(Clone)]
 pub struct ClusterClient {
     initial_nodes: Vec<ConnectionInfo>,
@@ -380,6 +515,22 @@ impl ClusterClient {
         cluster::ClusterConnection::new(self.cluster_params.clone(), self.initial_nodes.clone())
     }
 
+    /// Creates new connections to Redis Cluster nodes with a custom config and returns a
+    /// [`cluster_async::ClusterConnection`].
+    ///
+    /// # Errors
+    ///
+    /// An error is returned if there is a failure while creating connections or slots.
+    pub fn get_connection_with_config(
+        &self,
+        config: cluster::ClusterConfig,
+    ) -> RedisResult<cluster::ClusterConnection> {
+        cluster::ClusterConnection::new(
+            self.cluster_params.clone().with_config(config),
+            self.initial_nodes.clone(),
+        )
+    }
+
     /// Creates new connections to Redis Cluster nodes and returns a
     /// [`cluster_async::ClusterConnection`].
     ///
@@ -390,6 +541,24 @@ impl ClusterClient {
     pub async fn get_async_connection(&self) -> RedisResult<cluster_async::ClusterConnection> {
         cluster_async::ClusterConnection::new(&self.initial_nodes, self.cluster_params.clone())
             .await
+    }
+
+    /// Creates new connections to Redis Cluster nodes with a custom config and returns a
+    /// [`cluster_async::ClusterConnection`].
+    ///
+    /// # Errors
+    ///
+    /// An error is returned if there is a failure while creating connections or slots.
+    #[cfg(feature = "cluster-async")]
+    pub async fn get_async_connection_with_config(
+        &self,
+        config: cluster::ClusterConfig,
+    ) -> RedisResult<cluster_async::ClusterConnection> {
+        cluster_async::ClusterConnection::new(
+            &self.initial_nodes,
+            self.cluster_params.clone().with_config(config),
+        )
+        .await
     }
 
     #[doc(hidden)]
@@ -485,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn give_different_password_by_initial_nodes() {
+    fn fail_if_received_different_password_between_initial_nodes() {
         let result = ClusterClient::new(vec![
             "redis://:password1@127.0.0.1:6379",
             "redis://:password2@127.0.0.1:6378",
@@ -495,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn give_different_username_by_initial_nodes() {
+    fn fail_if_received_different_username_between_initial_nodes() {
         let result = ClusterClient::new(vec![
             "redis://user1:password@127.0.0.1:6379",
             "redis://user2:password@127.0.0.1:6378",
@@ -505,13 +674,33 @@ mod tests {
     }
 
     #[test]
+    fn fail_if_received_different_protocol_between_initial_nodes() {
+        let result = ClusterClient::new(vec![
+            "redis://127.0.0.1:6379/?protocol=3",
+            "redis://127.0.0.1:6378",
+            "redis://127.0.0.1:6377",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fail_if_received_different_tls_between_initial_nodes() {
+        let result = ClusterClient::new(vec![
+            "rediss://127.0.0.1:6379/",
+            "redis://127.0.0.1:6378",
+            "redis://127.0.0.1:6377",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn give_username_password_by_method() {
-        let client = ClusterClientBuilder::new(get_connection_data_with_password())
-            .password("pass".to_string())
+        let client = ClusterClientBuilder::new(get_connection_data_with_username_and_password())
+            .password("password".to_string())
             .username("user1".to_string())
             .build()
             .unwrap();
-        assert_eq!(client.cluster_params.password, Some("pass".to_string()));
+        assert_eq!(client.cluster_params.password, Some("password".to_string()));
         assert_eq!(client.cluster_params.username, Some("user1".to_string()));
     }
 
