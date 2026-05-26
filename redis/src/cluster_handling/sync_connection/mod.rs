@@ -1194,10 +1194,13 @@ fn connect_node<C: ConnectionLike + Connect>(
     let info = get_connection_info(node, cluster_params);
 
     let mut conn = C::connect(info, Some(cluster_params.connection_timeout))?;
-    // If READONLY is sent to primary nodes, it will have no effect.
-    // We set this unconditionally, because we don't know whether we'll be making read calls
-    // to replicas. (We allow overriding routing per-call)
-    cmd("READONLY").exec(&mut conn)?;
+    // Only send READONLY when this client may actually route reads to replicas.
+    // Azure Managed Redis rejects READONLY on primary-only connections, so we
+    // gate it on the presence of a read-routing factory rather than sending it
+    // unconditionally. (We allow overriding routing per-call.)
+    if cluster_params.read_routing_factory.is_some() {
+        cmd("READONLY").exec(&mut conn)?;
+    }
     conn.set_read_timeout(read_timeout)?;
     conn.set_write_timeout(write_timeout)?;
     Ok(conn)
