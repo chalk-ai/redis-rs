@@ -310,9 +310,17 @@ pub struct ClusterConnection<C = Connection> {
     cluster_params: ClusterParams,
 }
 
+/// Upper bound on the number of worker threads used to open node connections
+/// concurrently during a slot/connection refresh. Connecting is network-bound,
+/// so this is sized to cover typical clusters in a single wave while still
+/// capping the thread and file-descriptor burst for unusually large topologies.
+const MAX_CONCURRENT_CONNECTS: usize = 256;
+
 impl<C> ClusterConnection<C>
 where
-    C: ConnectionLike + Connect,
+    // `Send` is required so connections can be opened on worker threads during
+    // parallel connection refresh (see `refresh_slots`).
+    C: ConnectionLike + Connect + Send,
 {
     pub(crate) fn new(
         cluster_params: ClusterParams,
@@ -480,24 +488,79 @@ where
         nodes.dedup();
 
         let mut connections = self.connections.borrow_mut();
-        *connections = nodes
+
+        // Build a work item per node, salvaging any existing connection so the
+        // worker can try to reuse it before opening a fresh one.
+        let mut work: Vec<(NodeAddress, Option<C>)> = nodes
             .into_iter()
-            .filter_map(|addr| {
-                if let Some(mut conn) = connections.remove(addr) {
-                    if conn.check_connection() {
-                        return Some((addr.clone(), conn));
-                    }
-                }
-
-                if let Ok(mut conn) = self.connect(addr) {
-                    if conn.check_connection() {
-                        return Some((addr.clone(), conn));
-                    }
-                }
-
-                None
-            })
+            .map(|addr| (addr.clone(), connections.remove(addr)))
             .collect();
+        let node_count = work.len();
+
+        // Opening connections is dominated by network round-trips (TCP connect +
+        // READONLY + PING), and each node is independent. Doing them one-at-a-time
+        // serializes a large cluster's startup into seconds; instead we fan the
+        // work out across a bounded pool of scoped threads so the connects overlap.
+        // Reading these out of their `RefCell`s up front lets the workers borrow
+        // them without touching `&self`'s non-`Sync` interior.
+        let read_timeout = *self.read_timeout.borrow();
+        let write_timeout = *self.write_timeout.borrow();
+        let cluster_params = &self.cluster_params;
+
+        let mut refreshed: HashMap<NodeAddress, C> = HashMap::with_capacity(node_count);
+
+        if node_count > 0 {
+            // Cap concurrency so we don't spawn an unbounded thread/FD burst for
+            // very large clusters; round-robin nodes into that many buckets.
+            let worker_count = node_count.min(MAX_CONCURRENT_CONNECTS);
+            let mut buckets: Vec<Vec<(NodeAddress, Option<C>)>> =
+                (0..worker_count).map(|_| Vec::new()).collect();
+            for (i, item) in work.drain(..).enumerate() {
+                buckets[i % worker_count].push(item);
+            }
+
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = buckets
+                    .into_iter()
+                    .map(|bucket| {
+                        scope.spawn(move || {
+                            let mut opened = Vec::with_capacity(bucket.len());
+                            for (addr, existing) in bucket {
+                                // Reuse a still-healthy existing connection if we have one.
+                                if let Some(mut conn) = existing {
+                                    if conn.check_connection() {
+                                        opened.push((addr, conn));
+                                        continue;
+                                    }
+                                }
+
+                                if let Ok(mut conn) = connect_node::<C>(
+                                    &addr,
+                                    cluster_params,
+                                    read_timeout,
+                                    write_timeout,
+                                ) {
+                                    if conn.check_connection() {
+                                        opened.push((addr, conn));
+                                    }
+                                }
+                            }
+                            opened
+                        })
+                    })
+                    .collect();
+
+                for handle in handles {
+                    // A panicking worker just drops its nodes; this matches the
+                    // previous best-effort behavior of skipping unreachable nodes.
+                    if let Ok(opened) = handle.join() {
+                        refreshed.extend(opened);
+                    }
+                }
+            });
+        }
+
+        *connections = refreshed;
 
         Ok(())
     }
@@ -528,16 +591,12 @@ where
     }
 
     fn connect(&self, node: &NodeAddress) -> RedisResult<C> {
-        let info = get_connection_info(node, &self.cluster_params);
-
-        let mut conn = C::connect(info, Some(self.cluster_params.connection_timeout))?;
-        // If READONLY is sent to primary nodes, it will have no effect.
-        // We set this unconditionally, because we don't know whether we'll be making read calls
-        // to replicas. (We allow overriding routing per-call)
-        cmd("READONLY").exec(&mut conn)?;
-        conn.set_read_timeout(*self.read_timeout.borrow())?;
-        conn.set_write_timeout(*self.write_timeout.borrow())?;
-        Ok(conn)
+        connect_node(
+            node,
+            &self.cluster_params,
+            *self.read_timeout.borrow(),
+            *self.write_timeout.borrow(),
+        )
     }
 
     fn get_connection<'a>(
@@ -1014,7 +1073,7 @@ where
 }
 
 const MULTI: &[u8] = "*1\r\n$5\r\nMULTI\r\n".as_bytes();
-impl<C: Connect + ConnectionLike> ConnectionLike for ClusterConnection<C> {
+impl<C: Connect + ConnectionLike + Send> ConnectionLike for ClusterConnection<C> {
     fn supports_pipelining(&self) -> bool {
         false
     }
@@ -1118,6 +1177,30 @@ impl NodeCmd {
             addr: a,
         }
     }
+}
+
+/// Open a single connection to `node` and prepare it for cluster use.
+///
+/// This is a free function (rather than a `ClusterConnection` method) so it can
+/// run on a worker thread during parallel connection refresh without borrowing
+/// `&self`, which holds non-`Sync` `RefCell` state. The read/write timeouts are
+/// passed in by value so callers can read them out of their `RefCell`s up front.
+fn connect_node<C: ConnectionLike + Connect>(
+    node: &NodeAddress,
+    cluster_params: &ClusterParams,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+) -> RedisResult<C> {
+    let info = get_connection_info(node, cluster_params);
+
+    let mut conn = C::connect(info, Some(cluster_params.connection_timeout))?;
+    // If READONLY is sent to primary nodes, it will have no effect.
+    // We set this unconditionally, because we don't know whether we'll be making read calls
+    // to replicas. (We allow overriding routing per-call)
+    cmd("READONLY").exec(&mut conn)?;
+    conn.set_read_timeout(read_timeout)?;
+    conn.set_write_timeout(write_timeout)?;
+    Ok(conn)
 }
 
 fn get_random_connection<C: ConnectionLike + Connect + Sized>(
