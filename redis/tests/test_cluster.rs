@@ -674,6 +674,39 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_replica_filter_drop_all_connects_primaries_only() {
+        let name = "test_cluster_replica_filter_drop_all_connects_primaries_only";
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380, 6381],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ];
+
+        let MockEnv { connection, .. } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")]).replica_filter(|_addr| false),
+            name,
+            move |cmd: &[u8], _port| {
+                respond_startup_with_replica_using_config(name, cmd, Some(slots_config.clone()))
+            },
+        );
+
+        let ports = connection
+            .connected_node_addresses()
+            .into_iter()
+            .map(|addr| addr.port())
+            .collect::<Vec<_>>();
+        assert_eq!(ports, vec![6379, 6382]);
+        assert_eq!(connection.connected_node_count(), 2);
+    }
+
+    #[test]
     fn test_cluster_client_name_factory_names_each_connected_node() {
         let name = "test_cluster_client_name_factory_names_each_connected_node";
         let slots_config = vec![
