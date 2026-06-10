@@ -13,6 +13,13 @@ use crate::cluster_handling::read_routing::{RandomReplicaStrategy, ReadRoutingSt
 /// Returning `true` keeps the replica; `false` drops it before it enters the
 /// slot map. See [`ClusterClientBuilder::replica_filter`].
 pub type ReplicaFilter = dyn Fn(&NodeAddress) -> bool + Send + Sync;
+
+/// Builds the Redis client name for each cluster node connection.
+///
+/// The factory is called whenever the client opens a node connection. Returning
+/// a stable, low-cardinality name makes `CLIENT LIST` useful for debugging
+/// application-side connection fanout.
+pub type ClientNameFactory = dyn Fn(&NodeAddress) -> String + Send + Sync;
 use crate::connection::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
 use crate::errors::{ErrorKind, RedisError};
 #[cfg(feature = "cluster-async")]
@@ -122,6 +129,7 @@ pub(crate) struct ClusterParams {
     pub(crate) username: Option<ArcStr>,
     pub(crate) read_routing_factory: Option<Arc<dyn ReadRoutingStrategyFactory>>,
     pub(crate) replica_filter: Option<Arc<ReplicaFilter>>,
+    pub(crate) client_name_factory: Option<Arc<ClientNameFactory>>,
     /// tls indicates tls behavior of connections.
     /// When Some(TlsMode), connections use tls and verify certification depends on TlsMode.
     /// When None, connections do not use tls.
@@ -184,6 +192,7 @@ impl ClusterParams {
             username: value.username,
             read_routing_factory: value.read_routing_factory,
             replica_filter: value.replica_filter,
+            client_name_factory: None,
             tls: value.tls,
             retry_params: value.retries_configuration,
             tls_params,
@@ -226,6 +235,8 @@ impl ClusterParams {
         if let Some(async_dns_resolver) = config.async_dns_resolver {
             self.async_dns_resolver = Some(async_dns_resolver);
         }
+
+        self.client_name_factory = config.client_name_factory;
 
         self
     }
@@ -805,6 +816,20 @@ impl ClusterClient {
     }
 
     #[doc(hidden)]
+    pub fn get_generic_connection_with_config<C>(
+        &self,
+        config: cluster::ClusterConfig,
+    ) -> RedisResult<cluster::ClusterConnection<C>>
+    where
+        C: crate::ConnectionLike + crate::cluster::Connect + Send,
+    {
+        cluster::ClusterConnection::new(
+            self.cluster_params.clone().with_config(config),
+            self.initial_nodes.clone(),
+        )
+    }
+
+    #[doc(hidden)]
     #[cfg(feature = "cluster-async")]
     pub async fn get_async_generic_connection<C>(
         &self,
@@ -826,6 +851,7 @@ impl ClusterClient {
 #[cfg(test)]
 mod tests {
     use super::{ClusterClient, ClusterClientBuilder, ConnectionInfo, IntoConnectionInfo};
+    #[cfg(feature = "cluster-async")]
     use std::time::Duration;
 
     fn get_connection_data() -> Vec<ConnectionInfo> {

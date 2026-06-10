@@ -640,6 +640,150 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_connected_node_addresses_respect_replica_filter() {
+        let name = "test_cluster_connected_node_addresses_respect_replica_filter";
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380, 6381],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ];
+
+        let MockEnv { connection, .. } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .replica_filter(|addr| matches!(addr.port(), 6380 | 6384)),
+            name,
+            move |cmd: &[u8], _port| {
+                respond_startup_with_replica_using_config(name, cmd, Some(slots_config.clone()))
+            },
+        );
+
+        let ports = connection
+            .connected_node_addresses()
+            .into_iter()
+            .map(|addr| addr.port())
+            .collect::<Vec<_>>();
+        assert_eq!(ports, vec![6379, 6380, 6382, 6384]);
+        assert_eq!(connection.connected_node_count(), 4);
+    }
+
+    #[test]
+    fn test_cluster_client_name_factory_names_each_connected_node() {
+        let name = "test_cluster_client_name_factory_names_each_connected_node";
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6381,
+                replica_ports: vec![6382],
+                slot_range: 8192..16384,
+            },
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(u16, String)>::new()));
+        let seen_for_handler = seen.clone();
+
+        let _env = MockEnv::with_client_builder_and_config(
+            ClusterClient::builder(vec![&*format!("redis://{name}")]),
+            redis::cluster::ClusterConfig::new()
+                .set_client_name_factory(|addr| format!("mock-client-{}", addr.port())),
+            name,
+            move |cmd: &[u8], port| {
+                if contains_slice(cmd, b"CLIENT") && contains_slice(cmd, b"SETNAME") {
+                    seen_for_handler
+                        .lock()
+                        .unwrap()
+                        .push((port, String::from_utf8_lossy(cmd).into_owned()));
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                respond_startup_with_replica_using_config(name, cmd, Some(slots_config.clone()))
+            },
+        );
+
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_by_key(|(port, _)| *port);
+        assert_eq!(
+            seen.iter().map(|(port, _)| *port).collect::<Vec<_>>(),
+            vec![6379, 6380, 6381, 6382]
+        );
+        for (port, cmd) in seen {
+            assert!(cmd.contains(&format!("mock-client-{port}")));
+        }
+    }
+
+    #[test]
+    fn test_cluster_client_name_factory_names_new_nodes_after_refresh() {
+        let name = "test_cluster_client_name_factory_names_new_nodes_after_refresh";
+        let requests = atomic::AtomicUsize::new(0);
+        let started = atomic::AtomicBool::new(false);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(u16, String)>::new()));
+        let seen_for_handler = seen.clone();
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder_and_config(
+            ClusterClient::builder(vec![&*format!("redis://{name}")]),
+            redis::cluster::ClusterConfig::new()
+                .set_client_name_factory(|addr| format!("mock-client-{}", addr.port())),
+            name,
+            move |cmd: &[u8], port| {
+                if contains_slice(cmd, b"CLIENT") && contains_slice(cmd, b"SETNAME") {
+                    seen_for_handler
+                        .lock()
+                        .unwrap()
+                        .push((port, String::from_utf8_lossy(cmd).into_owned()));
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+
+                if !started.load(atomic::Ordering::SeqCst) {
+                    respond_startup(name, cmd)?;
+                }
+                started.store(true, atomic::Ordering::SeqCst);
+
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+
+                let i = requests.fetch_add(1, atomic::Ordering::SeqCst);
+                match i {
+                    0 => Err(parse_redis_value(b"-MOVED 123\r\n")),
+                    1 => Err(Ok(redis_value!([
+                        [0, 1, [name, 6379]],
+                        [2, 16383, [name, 6380]]
+                    ]))),
+                    _ => {
+                        assert_eq!(port, 6380);
+                        Err(Ok(redis_value!("123")))
+                    }
+                }
+            },
+        );
+
+        let value = cmd("GET").arg("test").query::<Option<i32>>(&mut connection);
+        assert_eq!(value, Ok(Some(123)));
+
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_by_key(|(port, _)| *port);
+        assert_eq!(
+            seen.iter().map(|(port, _)| *port).collect::<Vec<_>>(),
+            vec![6379, 6380]
+        );
+        for (port, cmd) in seen {
+            assert!(cmd.contains(&format!("mock-client-{port}")));
+        }
+    }
+
+    #[test]
     fn test_cluster_round_robin_read() {
         let name = "test_cluster_round_robin_read";
         let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
