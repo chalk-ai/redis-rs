@@ -1234,10 +1234,9 @@ fn connect_node<C: ConnectionLike + Connect>(
     let info = get_connection_info(node, cluster_params);
 
     let mut conn = C::connect(info, Some(cluster_params.connection_timeout))?;
-    // If READONLY is sent to primary nodes, it will have no effect.
-    // We set this unconditionally, because we don't know whether we'll be making read calls
-    // to replicas. (We allow overriding routing per-call)
-    cmd("READONLY").exec(&mut conn)?;
+    if cluster_params.read_routing_factory.is_some() {
+        cmd("READONLY").exec(&mut conn)?;
+    }
     set_client_name(&mut conn, node, cluster_params);
     conn.set_read_timeout(read_timeout)?;
     conn.set_write_timeout(write_timeout)?;
