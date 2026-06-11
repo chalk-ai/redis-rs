@@ -977,8 +977,8 @@ mod cluster_async {
         ));
 
         assert_eq!(value, Ok(redis_value!("PONG")));
-        // 6 - because of the 5 above, and then another READONLY for the new connection.
-        assert_eq!(connection_count_clone.load(Ordering::Relaxed), 6);
+        // 4 - because of the 3 above, and then another CLUSTER SLOTS for the new connection.
+        assert_eq!(connection_count_clone.load(Ordering::Relaxed), 4);
     }
 
     #[test]
