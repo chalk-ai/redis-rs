@@ -950,10 +950,9 @@ mod cluster_async {
             },
         );
 
-        // 5 - MockEnv creates sync & async connections. Each calls CLUSTER SLOTS once and
-        // READONLY per node during connect. The sync connection sends an additional READONLY
-        // in its connect() method.
-        assert_eq!(connection_count_clone.load(Ordering::Relaxed), 5);
+        // 3 - MockEnv creates sync & async connections. Each calls CLUSTER SLOTS once
+        // during connect. READONLY is only sent when read routing is configured.
+        assert_eq!(connection_count_clone.load(Ordering::Relaxed), 3);
 
         let value = runtime.block_on(connection.route_command(
             cmd("ECHO"),
@@ -978,8 +977,8 @@ mod cluster_async {
         ));
 
         assert_eq!(value, Ok(redis_value!("PONG")));
-        // 6 - because of the 5 above, and then another READONLY for the new connection.
-        assert_eq!(connection_count_clone.load(Ordering::Relaxed), 6);
+        // 4 - because of the 3 above, and then another CLUSTER SLOTS for the new connection.
+        assert_eq!(connection_count_clone.load(Ordering::Relaxed), 4);
     }
 
     #[test]
@@ -1070,7 +1069,7 @@ mod cluster_async {
                 .unwrap();
         }
 
-        assert_eq!(ping_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(ping_attempts.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2175,17 +2174,15 @@ mod cluster_async {
                 if is_connection_check(cmd) {
                     let connect_attempt = ping_attempts_clone.fetch_add(1, Ordering::Relaxed);
                     let past_get_attempts = get_attempts.load(Ordering::Relaxed);
-                    // We want connection checks to fail after the first GET attempt, until it retries. Hence, we wait for 5 PINGs -
-                    // 1. initial connection,
-                    // 2. refresh slots on client creation,
-                    // 3. refresh_connections `check_connection` after first GET failed,
-                    // 4. refresh_connections `connect_and_check` after first GET failed,
-                    // 5. reconnect on 2nd GET attempt.
-                    // more than 5 attempts mean that the server reconnects more than once, which is the behavior we're testing against.
-                    if past_get_attempts != 1 || connect_attempt > 3 {
+                    // We want connection checks to fail after the first GET attempt, until it retries. Hence, we wait for 2 PINGs -
+                    // 1. refresh_connections `connect_and_check` after first GET failed,
+                    // 2. reconnect on 2nd GET attempt.
+                    // READONLY is no longer sent without read routing configured.
+                    // more than 2 attempts mean that the server reconnects more than once, which is the behavior we're testing against.
+                    if past_get_attempts != 1 || connect_attempt > 1 {
                         respond_startup_two_nodes(name, cmd)?;
                     }
-                    if connect_attempt > 5 {
+                    if connect_attempt > 2 {
                         panic!("Too many pings!");
                     }
                     Err(Err(broken_pipe_error()))
@@ -2214,8 +2211,8 @@ mod cluster_async {
             assert_eq!(value, Ok(Some(123)));
         }
         // If you need to change the number here due to a change in the cluster, you probably also need to adjust the test.
-        // See the PING counts above to explain why 5 is the target number.
-        assert_eq!(ping_attempts.load(Ordering::Acquire), 5);
+        // See the PING counts above to explain why 2 is the target number.
+        assert_eq!(ping_attempts.load(Ordering::Acquire), 2);
     }
 
     #[async_test]
