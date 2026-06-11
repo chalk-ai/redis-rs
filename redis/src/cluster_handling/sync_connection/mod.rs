@@ -64,6 +64,7 @@
 //! ```
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -231,6 +232,7 @@ impl Connect for Connection {
 pub struct ClusterConfig {
     pub(crate) connection_timeout: Option<Duration>,
     pub(crate) response_timeout: Option<Duration>,
+    pub(crate) client_name_factory: Option<Arc<super::client::ClientNameFactory>>,
     #[cfg(feature = "cluster-async")]
     pub(crate) async_push_sender: Option<std::sync::Arc<dyn crate::aio::AsyncPushSender>>,
     #[cfg(feature = "cluster-async")]
@@ -252,6 +254,20 @@ impl ClusterConfig {
     /// Sets the response timeout
     pub fn set_response_timeout(mut self, response_timeout: std::time::Duration) -> Self {
         self.response_timeout = Some(response_timeout);
+        self
+    }
+
+    /// Sets a factory that builds a Redis client name for each cluster node
+    /// connection opened by this `ClusterConnection`.
+    ///
+    /// The name is sent with `CLIENT SETNAME` after the connection enters
+    /// cluster-read mode. Errors are ignored so naming never prevents a usable
+    /// connection from being established.
+    pub fn set_client_name_factory(
+        mut self,
+        factory: impl Fn(&NodeAddress) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.client_name_factory = Some(Arc::new(factory));
         self
     }
 
@@ -308,6 +324,30 @@ pub struct ClusterConnection<C = Connection> {
     write_timeout: RefCell<Option<Duration>>,
     routing_strategy: Option<Box<dyn ReadRoutingStrategy>>,
     cluster_params: ClusterParams,
+}
+
+impl<C> ClusterConnection<C> {
+    /// Returns the node addresses that currently have open connections.
+    ///
+    /// This method is intended for diagnostics and tests. The result is a
+    /// moment-in-time snapshot and should not be used for routing decisions.
+    #[doc(hidden)]
+    pub fn connected_node_addresses(&self) -> Vec<NodeAddress> {
+        let mut addrs = self
+            .connections
+            .borrow()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        addrs.sort_unstable();
+        addrs
+    }
+
+    /// Returns the number of node connections currently held by this cluster connection.
+    #[doc(hidden)]
+    pub fn connected_node_count(&self) -> usize {
+        self.connections.borrow().len()
+    }
 }
 
 /// Upper bound on the number of worker threads used to open node connections
@@ -1198,9 +1238,25 @@ fn connect_node<C: ConnectionLike + Connect>(
     // We set this unconditionally, because we don't know whether we'll be making read calls
     // to replicas. (We allow overriding routing per-call)
     cmd("READONLY").exec(&mut conn)?;
+    set_client_name(&mut conn, node, cluster_params);
     conn.set_read_timeout(read_timeout)?;
     conn.set_write_timeout(write_timeout)?;
     Ok(conn)
+}
+
+fn set_client_name<C: ConnectionLike>(
+    conn: &mut C,
+    node: &NodeAddress,
+    cluster_params: &ClusterParams,
+) {
+    let Some(factory) = &cluster_params.client_name_factory else {
+        return;
+    };
+    let name = factory(node);
+    if name.is_empty() {
+        return;
+    }
+    let _ = cmd("CLIENT").arg("SETNAME").arg(name).exec(conn);
 }
 
 fn get_random_connection<C: ConnectionLike + Connect + Sized>(

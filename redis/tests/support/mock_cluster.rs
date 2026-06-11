@@ -318,6 +318,20 @@ impl MockEnv {
         id: &str,
         handler: impl Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync + 'static,
     ) -> Self {
+        Self::with_client_builder_and_config(
+            client_builder,
+            redis::cluster::ClusterConfig::new(),
+            id,
+            handler,
+        )
+    }
+
+    pub fn with_client_builder_and_config(
+        client_builder: ClusterClientBuilder,
+        connection_config: redis::cluster::ClusterConfig,
+        id: &str,
+        handler: impl Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync + 'static,
+    ) -> Self {
         #[cfg(feature = "cluster-async")]
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -332,7 +346,9 @@ impl MockEnv {
             .insert(id.clone(), Arc::new(move |cmd, port| handler(cmd, port)));
 
         let client = client_builder.build().unwrap();
-        let connection = client.get_generic_connection().unwrap();
+        let connection = client
+            .get_generic_connection_with_config(connection_config)
+            .unwrap();
         #[cfg(feature = "cluster-async")]
         let async_connection = runtime
             .block_on(client.get_async_generic_connection())

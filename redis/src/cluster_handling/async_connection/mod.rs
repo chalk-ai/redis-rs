@@ -1555,6 +1555,15 @@ where
     let mut readonly_cmd = cmd("READONLY");
     readonly_cmd.skip_concurrency_limit = true;
     conn.req_packed_command(&readonly_cmd).await?;
+    if let Some(factory) = &params.client_name_factory {
+        let name = factory(node);
+        if !name.is_empty() {
+            let mut setname_cmd = cmd("CLIENT");
+            setname_cmd.arg("SETNAME").arg(name);
+            setname_cmd.skip_concurrency_limit = true;
+            let _ = conn.req_packed_command(&setname_cmd).await;
+        }
+    }
     Ok(conn)
 }
 
