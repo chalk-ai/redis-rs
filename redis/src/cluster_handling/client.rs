@@ -535,7 +535,7 @@ impl ClusterClientBuilder {
     /// and hostname parsing.
     ///
     /// To share discovery results across multiple clients in one process,
-    /// create a [`ZonalReadRoutingStrategy`](crate::cluster_read_routing::ZonalReadRoutingStrategy)
+    /// create a [`ZonalReadRoutingStrategy`]
     /// with `shared` and pass clones to
     /// [`read_routing_strategy`](Self::read_routing_strategy).
     pub fn read_from_zonal_replicas(
