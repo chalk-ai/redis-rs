@@ -294,7 +294,7 @@ mod tests {
             clone
                 .node_availability_zone_discovery_cache()
                 .unwrap()
-                .cached_zones(&[cached_node.clone()])
+                .cached_zones(std::slice::from_ref(&cached_node))
                 .get(&cached_node),
             Some(&ArcStr::from("us-east-1b"))
         );
