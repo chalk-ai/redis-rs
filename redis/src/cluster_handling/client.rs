@@ -533,6 +533,11 @@ impl ClusterClientBuilder {
     /// The client discovers node availability zones during topology refresh
     /// using supported cluster metadata such as `CLUSTER SHARDS`, `INFO SERVER`,
     /// and hostname parsing.
+    ///
+    /// To share discovery results across multiple clients in one process,
+    /// create a [`ZonalReadRoutingStrategy`](crate::cluster_read_routing::ZonalReadRoutingStrategy)
+    /// with `shared` and pass clones to
+    /// [`read_routing_strategy`](Self::read_routing_strategy).
     pub fn read_from_zonal_replicas(
         self,
         availability_zone: impl Into<ArcStr>,

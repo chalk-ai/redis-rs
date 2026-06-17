@@ -5,7 +5,8 @@ use std::sync::{Arc, RwLock};
 use arcstr::ArcStr;
 
 use super::interface::{
-    ClusterTopology, ReadCandidates, ReadRoutingStrategy, ReadRoutingStrategyFactory,
+    ClusterTopology, NodeAvailabilityZoneDiscoveryCache, NodeAvailabilityZoneDiscoveryState,
+    ReadCandidates, ReadRoutingStrategy, ReadRoutingStrategyFactory,
 };
 use crate::cluster_handling::NodeAddress;
 use crate::cluster_handling::slot_range_map::SlotRangeMap;
@@ -33,6 +34,7 @@ struct SlotStates {
 /// for shards with no same-zone replica.
 pub struct ZonalReadRoutingStrategy {
     availability_zone: ArcStr,
+    shared_state: Arc<NodeAvailabilityZoneDiscoveryState>,
     state: Arc<RwLock<SlotStates>>,
 }
 
@@ -41,10 +43,20 @@ impl ZonalReadRoutingStrategy {
     pub fn new(availability_zone: impl Into<ArcStr>) -> Self {
         Self {
             availability_zone: availability_zone.into(),
+            shared_state: Arc::new(NodeAvailabilityZoneDiscoveryState::default()),
             state: Arc::new(RwLock::new(SlotStates {
                 slots: SlotRangeMap::new(),
             })),
         }
+    }
+
+    /// Creates a cloneable zonal strategy handle for sharing discovery state
+    /// across multiple clients in the same process.
+    ///
+    /// Clones of the returned strategy share availability-zone discovery
+    /// results, but each connection keeps independent per-slot routing counters.
+    pub fn shared(availability_zone: impl Into<ArcStr>) -> Self {
+        Self::new(availability_zone)
     }
 
     /// Returns the caller availability zone this strategy prefers.
@@ -53,15 +65,29 @@ impl ZonalReadRoutingStrategy {
     }
 }
 
+impl Clone for ZonalReadRoutingStrategy {
+    fn clone(&self) -> Self {
+        Self {
+            availability_zone: self.availability_zone.clone(),
+            shared_state: Arc::clone(&self.shared_state),
+            state: Arc::new(RwLock::new(SlotStates {
+                slots: SlotRangeMap::new(),
+            })),
+        }
+    }
+}
+
 impl ReadRoutingStrategyFactory for ZonalReadRoutingStrategy {
     fn create_strategy(&self) -> Box<dyn ReadRoutingStrategy> {
-        Box::new(Self::new(self.availability_zone.clone()))
+        Box::new(self.clone())
     }
 }
 
 impl ReadRoutingStrategy for ZonalReadRoutingStrategy {
-    fn requires_node_availability_zones(&self) -> bool {
-        true
+    fn node_availability_zone_discovery_cache(
+        &self,
+    ) -> Option<Arc<dyn NodeAvailabilityZoneDiscoveryCache>> {
+        Some(self.shared_state.clone())
     }
 
     fn on_topology_changed(&self, topology: ClusterTopology) {
@@ -154,7 +180,11 @@ impl ReadRoutingStrategy for ZonalReadRoutingStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster_handling::read_routing::{Replicas, Shard};
+    use std::collections::HashMap;
+
+    use crate::cluster_handling::read_routing::{
+        NodeAvailabilityZoneCoverage, NodeAvailabilityZoneDiscoveryMethod, Replicas, Shard,
+    };
 
     fn node(host: &str, port: u16) -> NodeAddress {
         NodeAddress::from_parts(host.into(), port)
@@ -232,5 +262,54 @@ mod tests {
         assert!(!nodes.contains(&node("replica1b", 6379)));
         assert!(nodes.contains(&node("replica2a", 6379)));
         assert!(nodes.contains(&node("replica2b", 6379)));
+    }
+
+    #[test]
+    fn shared_discovery_state_logs_only_important_coverage_transitions() {
+        let cache = NodeAvailabilityZoneDiscoveryState::default();
+
+        assert!(!cache.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
+        assert!(!cache.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
+        assert!(cache.should_log_coverage(NodeAvailabilityZoneCoverage::None));
+        assert!(!cache.should_log_coverage(NodeAvailabilityZoneCoverage::None));
+        assert!(cache.should_log_coverage(NodeAvailabilityZoneCoverage::Partial));
+        assert!(!cache.should_log_coverage(NodeAvailabilityZoneCoverage::Partial));
+        assert!(cache.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
+    }
+
+    #[test]
+    fn cloned_strategies_share_discovered_zones_but_not_slot_counters() {
+        let strategy = ZonalReadRoutingStrategy::shared("us-east-1b");
+        let clone = strategy.clone();
+        let cached_node = node("replica1a", 6379);
+        let mut zones = HashMap::new();
+        zones.insert(cached_node.clone(), ArcStr::from("us-east-1b"));
+
+        strategy
+            .node_availability_zone_discovery_cache()
+            .unwrap()
+            .record_success(NodeAvailabilityZoneDiscoveryMethod::ClusterShards, &zones);
+
+        assert_eq!(
+            clone
+                .node_availability_zone_discovery_cache()
+                .unwrap()
+                .cached_zones(&[cached_node.clone()])
+                .get(&cached_node),
+            Some(&ArcStr::from("us-east-1b"))
+        );
+
+        strategy.on_topology_changed(topology());
+        clone.on_topology_changed(topology());
+        let replicas = [
+            node("replica1a", 6379),
+            node("replica1b", 6379),
+            node("replica1c", 6379),
+        ];
+        let candidates = ReadCandidates::replicas_only(1, Replicas::new(&replicas).unwrap());
+
+        assert_eq!(strategy.route_read(&candidates), &replicas[0]);
+        assert_eq!(strategy.route_read(&candidates), &replicas[2]);
+        assert_eq!(clone.route_read(&candidates), &replicas[0]);
     }
 }

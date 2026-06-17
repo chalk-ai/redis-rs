@@ -115,16 +115,19 @@ use crate::{
         NodeAddress,
         client::ClusterParams,
         get_connection_info, info_server_cmd,
-        read_routing::ReadRoutingStrategy,
+        read_routing::{
+            NodeAvailabilityZoneCoverage, NodeAvailabilityZoneDiscoveryCache,
+            NodeAvailabilityZoneDiscoveryMethod, NodeAvailabilityZoneDiscoveryState,
+            ReadRoutingStrategy,
+        },
         routing::{
             MultipleNodeRoutingInfo, Redirect, ResponsePolicy, RoutingInfo, SingleNodeRoutingInfo,
         },
         shard_cmd, slot_cmd,
         slot_map::{SlotMap, SlotRange},
         topology::{
-            NodeAvailabilityZoneCoverage, NodeAvailabilityZoneDiscovery,
-            NodeAvailabilityZoneDiscoveryMethod, parse_cluster_shards_availability_zones,
-            parse_hostname_availability_zone, parse_info_server_availability_zone, parse_slots,
+            parse_cluster_shards_availability_zones, parse_hostname_availability_zone,
+            parse_info_server_availability_zone, parse_slots,
         },
     },
     cmd,
@@ -449,7 +452,7 @@ struct InnerCore<C> {
     initial_nodes: Vec<ConnectionInfo>,
     subscription_tracker: Option<Mutex<SubscriptionTracker>>,
     routing_strategy: Option<Box<dyn ReadRoutingStrategy>>,
-    az_discovery: Mutex<NodeAvailabilityZoneDiscovery>,
+    az_discovery: Arc<NodeAvailabilityZoneDiscoveryState>,
 }
 
 /// This is a clonable wrapper.
@@ -930,7 +933,7 @@ where
         if let Some(ref strategy) = self.routing_strategy {
             if strategy.requires_node_availability_zones() {
                 let zones = self
-                    .discover_node_availability_zones(connections, slots)
+                    .discover_node_availability_zones(strategy.as_ref(), connections, slots)
                     .await;
                 slots.set_node_availability_zones(zones);
             }
@@ -952,69 +955,83 @@ where
 
     async fn discover_node_availability_zones(
         &self,
+        strategy: &dyn ReadRoutingStrategy,
         connections: &mut ConnectionMap<C>,
         slots: &SlotMap,
     ) -> HashMap<NodeAddress, ArcStr> {
         let nodes = Self::nodes_for_availability_zone_discovery(slots);
-        let mut best_zones = HashMap::new();
-        let preferred_method = self
-            .az_discovery
-            .lock()
-            .expect("Lock poisoned")
-            .preferred_method();
+        let cache = strategy
+            .node_availability_zone_discovery_cache()
+            .unwrap_or_else(|| self.az_discovery.clone());
+        let mut best_zones = cache.cached_zones(&nodes);
+
+        if Self::zones_cover_all_nodes(&best_zones, &nodes) {
+            self.log_node_availability_zone_coverage(cache.as_ref(), best_zones.len(), nodes.len());
+            return best_zones;
+        }
+
+        let preferred_method = cache.preferred_method();
         if let Some(method) = preferred_method {
-            let zones = self
+            let mut zones = self
                 .discover_node_availability_zones_with_method(method, connections, slots)
                 .await;
+            Self::retain_zones_for_nodes(&mut zones, &nodes);
             if Self::zones_cover_all_nodes(&zones, &nodes) {
-                self.az_discovery
-                    .lock()
-                    .expect("Lock poisoned")
-                    .record_success(method);
-                self.log_node_availability_zone_coverage(zones.len(), nodes.len());
+                cache.record_success(method, &zones);
+                self.log_node_availability_zone_coverage(cache.as_ref(), zones.len(), nodes.len());
                 return zones;
             }
-            if !zones.is_empty() {
-                best_zones = zones;
+            best_zones.extend(zones);
+            if Self::zones_cover_all_nodes(&best_zones, &nodes) {
+                cache.update_zones(&best_zones);
+                self.log_node_availability_zone_coverage(
+                    cache.as_ref(),
+                    best_zones.len(),
+                    nodes.len(),
+                );
+                return best_zones;
             }
-            self.az_discovery
-                .lock()
-                .expect("Lock poisoned")
-                .record_failure(method);
+            cache.record_failure(method);
         }
 
         for method in NodeAvailabilityZoneDiscoveryMethod::ALL {
             if Some(method) == preferred_method {
                 continue;
             }
-            let zones = self
+            let mut zones = self
                 .discover_node_availability_zones_with_method(method, connections, slots)
                 .await;
+            Self::retain_zones_for_nodes(&mut zones, &nodes);
             if Self::zones_cover_all_nodes(&zones, &nodes) {
-                self.az_discovery
-                    .lock()
-                    .expect("Lock poisoned")
-                    .record_success(method);
-                self.log_node_availability_zone_coverage(zones.len(), nodes.len());
+                cache.record_success(method, &zones);
+                self.log_node_availability_zone_coverage(cache.as_ref(), zones.len(), nodes.len());
                 return zones;
             }
-            if zones.len() > best_zones.len() {
-                best_zones = zones;
+            best_zones.extend(zones);
+            if Self::zones_cover_all_nodes(&best_zones, &nodes) {
+                cache.update_zones(&best_zones);
+                self.log_node_availability_zone_coverage(
+                    cache.as_ref(),
+                    best_zones.len(),
+                    nodes.len(),
+                );
+                return best_zones;
             }
         }
 
-        self.log_node_availability_zone_coverage(best_zones.len(), nodes.len());
+        cache.update_zones(&best_zones);
+        self.log_node_availability_zone_coverage(cache.as_ref(), best_zones.len(), nodes.len());
         best_zones
     }
 
-    fn log_node_availability_zone_coverage(&self, known_nodes: usize, total_nodes: usize) {
+    fn log_node_availability_zone_coverage(
+        &self,
+        cache: &dyn NodeAvailabilityZoneDiscoveryCache,
+        known_nodes: usize,
+        total_nodes: usize,
+    ) {
         let coverage = NodeAvailabilityZoneCoverage::from_counts(known_nodes, total_nodes);
-        if !self
-            .az_discovery
-            .lock()
-            .expect("Lock poisoned")
-            .should_log_coverage(coverage)
-        {
+        if !cache.should_log_coverage(coverage) {
             return;
         }
 
@@ -1067,6 +1084,10 @@ where
 
     fn zones_cover_all_nodes(zones: &HashMap<NodeAddress, ArcStr>, nodes: &[NodeAddress]) -> bool {
         !nodes.is_empty() && nodes.iter().all(|node| zones.contains_key(node))
+    }
+
+    fn retain_zones_for_nodes(zones: &mut HashMap<NodeAddress, ArcStr>, nodes: &[NodeAddress]) {
+        zones.retain(|node, _| nodes.binary_search(node).is_ok());
     }
 
     async fn discover_node_availability_zones_with_cluster_shards(
@@ -1297,7 +1318,7 @@ where
             initial_nodes: initial_nodes.to_vec(),
             subscription_tracker,
             routing_strategy,
-            az_discovery: Mutex::new(NodeAvailabilityZoneDiscovery::default()),
+            az_discovery: Arc::new(NodeAvailabilityZoneDiscoveryState::default()),
         });
         let core = Core(inner);
         let mut inner = ClusterConnInner {

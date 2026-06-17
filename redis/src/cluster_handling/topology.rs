@@ -8,67 +8,6 @@ use super::NodeAddress;
 use super::slot_map::SlotRange;
 use crate::{RedisResult, Value, connection::is_wildcard_address};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeAvailabilityZoneDiscoveryMethod {
-    ClusterShards,
-    InfoServer,
-    Hostname,
-}
-
-impl NodeAvailabilityZoneDiscoveryMethod {
-    pub(crate) const ALL: [Self; 3] = [Self::ClusterShards, Self::Hostname, Self::InfoServer];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeAvailabilityZoneCoverage {
-    None,
-    Partial,
-    Complete,
-}
-
-impl NodeAvailabilityZoneCoverage {
-    pub(crate) fn from_counts(known_nodes: usize, total_nodes: usize) -> Self {
-        if known_nodes == 0 {
-            Self::None
-        } else if known_nodes >= total_nodes {
-            Self::Complete
-        } else {
-            Self::Partial
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct NodeAvailabilityZoneDiscovery {
-    preferred_method: Option<NodeAvailabilityZoneDiscoveryMethod>,
-    last_coverage: Option<NodeAvailabilityZoneCoverage>,
-}
-
-impl NodeAvailabilityZoneDiscovery {
-    pub(crate) fn preferred_method(&self) -> Option<NodeAvailabilityZoneDiscoveryMethod> {
-        self.preferred_method
-    }
-
-    pub(crate) fn record_success(&mut self, method: NodeAvailabilityZoneDiscoveryMethod) {
-        self.preferred_method = Some(method);
-    }
-
-    pub(crate) fn record_failure(&mut self, method: NodeAvailabilityZoneDiscoveryMethod) {
-        if self.preferred_method == Some(method) {
-            self.preferred_method = None;
-        }
-    }
-
-    pub(crate) fn should_log_coverage(&mut self, coverage: NodeAvailabilityZoneCoverage) -> bool {
-        let previous = self.last_coverage.replace(coverage);
-        match (previous, coverage) {
-            (None, NodeAvailabilityZoneCoverage::Complete) => false,
-            (None, _) => true,
-            (Some(previous), current) => previous != current,
-        }
-    }
-}
-
 // Parse slot data from raw redis value.
 pub(crate) fn parse_slots(
     raw_slot_resp: Value,
@@ -553,18 +492,5 @@ mod tests {
             parse_hostname_availability_zone("redis.us-central1-a.example.internal"),
             Some(ArcStr::from("us-central1-a"))
         );
-    }
-
-    #[test]
-    fn availability_zone_discovery_logs_only_important_coverage_transitions() {
-        let mut discovery = NodeAvailabilityZoneDiscovery::default();
-
-        assert!(!discovery.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
-        assert!(!discovery.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
-        assert!(discovery.should_log_coverage(NodeAvailabilityZoneCoverage::None));
-        assert!(!discovery.should_log_coverage(NodeAvailabilityZoneCoverage::None));
-        assert!(discovery.should_log_coverage(NodeAvailabilityZoneCoverage::Partial));
-        assert!(!discovery.should_log_coverage(NodeAvailabilityZoneCoverage::Partial));
-        assert!(discovery.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
     }
 }

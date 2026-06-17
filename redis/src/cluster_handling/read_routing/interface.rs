@@ -1,11 +1,139 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use arcstr::ArcStr;
 
 use super::super::NodeAddress;
 use super::super::slot_range_map::SlotRangeMap;
+
+/// Availability-zone metadata discovery methods used by zonal read routing.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAvailabilityZoneDiscoveryMethod {
+    ClusterShards,
+    Hostname,
+    InfoServer,
+}
+
+impl NodeAvailabilityZoneDiscoveryMethod {
+    pub(crate) const ALL: [Self; 3] = [Self::ClusterShards, Self::Hostname, Self::InfoServer];
+}
+
+/// Availability-zone metadata coverage for a topology snapshot.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAvailabilityZoneCoverage {
+    None,
+    Partial,
+    Complete,
+}
+
+impl NodeAvailabilityZoneCoverage {
+    pub(crate) fn from_counts(known_nodes: usize, total_nodes: usize) -> Self {
+        if known_nodes == 0 {
+            Self::None
+        } else if known_nodes >= total_nodes {
+            Self::Complete
+        } else {
+            Self::Partial
+        }
+    }
+}
+
+/// Shared availability-zone discovery state for strategies that need it.
+#[doc(hidden)]
+pub trait NodeAvailabilityZoneDiscoveryCache: Send + Sync {
+    fn cached_zones(&self, nodes: &[NodeAddress]) -> HashMap<NodeAddress, ArcStr>;
+
+    fn update_zones(&self, zones: &HashMap<NodeAddress, ArcStr>);
+
+    fn preferred_method(&self) -> Option<NodeAvailabilityZoneDiscoveryMethod>;
+
+    fn record_success(
+        &self,
+        method: NodeAvailabilityZoneDiscoveryMethod,
+        zones: &HashMap<NodeAddress, ArcStr>,
+    );
+
+    fn record_failure(&self, method: NodeAvailabilityZoneDiscoveryMethod);
+
+    fn should_log_coverage(&self, coverage: NodeAvailabilityZoneCoverage) -> bool;
+}
+
+#[derive(Debug, Default)]
+struct NodeAvailabilityZoneDiscoveryStateInner {
+    preferred_method: Option<NodeAvailabilityZoneDiscoveryMethod>,
+    last_coverage: Option<NodeAvailabilityZoneCoverage>,
+    node_zones: HashMap<NodeAddress, ArcStr>,
+}
+
+/// Availability-zone discovery cache shared by zonal read-routing strategy
+/// clones or scoped to one connection for custom strategies.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct NodeAvailabilityZoneDiscoveryState {
+    state: RwLock<NodeAvailabilityZoneDiscoveryStateInner>,
+}
+
+impl NodeAvailabilityZoneDiscoveryCache for NodeAvailabilityZoneDiscoveryState {
+    fn cached_zones(&self, nodes: &[NodeAddress]) -> HashMap<NodeAddress, ArcStr> {
+        let state = self.state.read().expect("Lock poisoned");
+        nodes
+            .iter()
+            .filter_map(|node| {
+                state
+                    .node_zones
+                    .get(node)
+                    .map(|zone| (node.clone(), zone.clone()))
+            })
+            .collect()
+    }
+
+    fn update_zones(&self, zones: &HashMap<NodeAddress, ArcStr>) {
+        let mut state = self.state.write().expect("Lock poisoned");
+        state.node_zones.extend(
+            zones
+                .iter()
+                .map(|(node, zone)| (node.clone(), zone.clone())),
+        );
+    }
+
+    fn preferred_method(&self) -> Option<NodeAvailabilityZoneDiscoveryMethod> {
+        self.state.read().expect("Lock poisoned").preferred_method
+    }
+
+    fn record_success(
+        &self,
+        method: NodeAvailabilityZoneDiscoveryMethod,
+        zones: &HashMap<NodeAddress, ArcStr>,
+    ) {
+        let mut state = self.state.write().expect("Lock poisoned");
+        state.preferred_method = Some(method);
+        state.node_zones.extend(
+            zones
+                .iter()
+                .map(|(node, zone)| (node.clone(), zone.clone())),
+        );
+    }
+
+    fn record_failure(&self, method: NodeAvailabilityZoneDiscoveryMethod) {
+        let mut state = self.state.write().expect("Lock poisoned");
+        if state.preferred_method == Some(method) {
+            state.preferred_method = None;
+        }
+    }
+
+    fn should_log_coverage(&self, coverage: NodeAvailabilityZoneCoverage) -> bool {
+        let mut state = self.state.write().expect("Lock poisoned");
+        let previous = state.last_coverage.replace(coverage);
+        match (previous, coverage) {
+            (None, NodeAvailabilityZoneCoverage::Complete) => false,
+            (None, _) => true,
+            (Some(previous), current) => previous != current,
+        }
+    }
+}
 
 /// A snapshot of the topology for a single shard in the cluster.
 ///
@@ -269,6 +397,15 @@ impl<'a> ReadCandidates<'a> {
 /// }
 /// ```
 pub trait ReadRoutingStrategy: Send + Sync {
+    /// Returns shared availability-zone discovery state for strategies that
+    /// need per-node zone metadata.
+    #[doc(hidden)]
+    fn node_availability_zone_discovery_cache(
+        &self,
+    ) -> Option<Arc<dyn NodeAvailabilityZoneDiscoveryCache>> {
+        None
+    }
+
     /// Returns true when the strategy benefits from per-node availability-zone
     /// metadata in [`ClusterTopology`].
     ///
@@ -276,7 +413,7 @@ pub trait ReadRoutingStrategy: Send + Sync {
     /// best-effort metadata discovery during topology refresh before
     /// [`on_topology_changed`](Self::on_topology_changed) is called.
     fn requires_node_availability_zones(&self) -> bool {
-        false
+        self.node_availability_zone_discovery_cache().is_some()
     }
 
     /// Called when the connection discovers or refreshes the cluster topology.

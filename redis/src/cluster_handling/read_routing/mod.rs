@@ -17,7 +17,9 @@ mod round_robin_replica;
 mod zonal_read_routing;
 
 pub use interface::{
-    AnyNodeCandidates, ClusterTopology, ReadCandidates, ReadRoutingStrategy,
+    AnyNodeCandidates, ClusterTopology, NodeAvailabilityZoneCoverage,
+    NodeAvailabilityZoneDiscoveryCache, NodeAvailabilityZoneDiscoveryMethod,
+    NodeAvailabilityZoneDiscoveryState, ReadCandidates, ReadRoutingStrategy,
     ReadRoutingStrategyFactory, Replicas, ReplicasOnlyCandidates, Shard,
 };
 pub use random_replica::RandomReplicaStrategy;

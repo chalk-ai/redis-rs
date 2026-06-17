@@ -13,7 +13,9 @@ mod cluster {
     use redis::{
         Commands, ConnectionLike, ErrorKind, RedisError, ServerErrorKind, Value,
         cluster::{ClusterClient, ClusterConnection, cluster_pipe},
-        cluster_read_routing::{RandomReplicaStrategy, RoundRobinReplicaStrategy},
+        cluster_read_routing::{
+            RandomReplicaStrategy, RoundRobinReplicaStrategy, ZonalReadRoutingStrategy,
+        },
         cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo, SingleNodeRoutingInfo},
         cmd, parse_redis_value,
     };
@@ -829,8 +831,8 @@ mod cluster {
     }
 
     #[test]
-    fn test_cluster_zonal_read_remembers_info_server_discovery_method() {
-        let name = "test_cluster_zonal_read_remembers_info_server_discovery_method";
+    fn test_cluster_zonal_read_reuses_info_server_discovery_results_after_refresh() {
+        let name = "test_cluster_zonal_read_reuses_info_server_discovery_results_after_refresh";
         let shards_calls = Arc::new(atomic::AtomicUsize::new(0));
         let shards_calls_clone = shards_calls.clone();
         let info_calls = Arc::new(atomic::AtomicUsize::new(0));
@@ -889,7 +891,9 @@ mod cluster {
         );
 
         let shards_calls_after_setup = shards_calls.load(atomic::Ordering::SeqCst);
+        let info_calls_after_setup = info_calls.load(atomic::Ordering::SeqCst);
         assert!(shards_calls_after_setup >= 1);
+        assert!(info_calls_after_setup >= 3);
         assert_eq!(
             connection
                 .connected_node_addresses()
@@ -906,7 +910,77 @@ mod cluster {
             shards_calls.load(atomic::Ordering::SeqCst),
             shards_calls_after_setup
         );
-        assert!(info_calls.load(atomic::Ordering::SeqCst) >= 6);
+        assert_eq!(
+            info_calls.load(atomic::Ordering::SeqCst),
+            info_calls_after_setup
+        );
+    }
+
+    #[test]
+    fn test_cluster_zonal_read_shared_strategy_reuses_discovered_az_metadata() {
+        let name = "test_cluster_zonal_read_shared_strategy_reuses_discovered_az_metadata";
+        let shards_calls = Arc::new(atomic::AtomicUsize::new(0));
+        let slots_config = vec![MockSlotRange {
+            primary_port: 6379,
+            replica_ports: vec![6380, 6381],
+            slot_range: 0..16384,
+        }];
+        let zones = vec![
+            (6379, "us-east-1b"),
+            (6380, "us-east-1b"),
+            (6381, "us-east-1c"),
+        ];
+        let strategy = ZonalReadRoutingStrategy::shared("us-east-1b");
+        let make_handler = {
+            let slots_config = slots_config.clone();
+            let zones = zones.clone();
+            move |shards_calls: Arc<atomic::AtomicUsize>| {
+                let slots_config = slots_config.clone();
+                let zones = zones.clone();
+                move |cmd: &[u8], _port| {
+                    if is_connection_check(cmd) {
+                        return Err(Ok(redis_value!(simple:"OK")));
+                    }
+                    if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                        return respond_startup_with_replica_using_config(
+                            name,
+                            cmd,
+                            Some(slots_config.clone()),
+                        );
+                    }
+                    if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                        shards_calls.fetch_add(1, Ordering::SeqCst);
+                        return Err(Ok(cluster_shards_with_zones(name, &slots_config, &zones)));
+                    }
+                    Ok(())
+                }
+            }
+        };
+
+        let _first = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_routing_strategy(strategy.clone()),
+            name,
+            make_handler(shards_calls.clone()),
+        );
+        assert_eq!(shards_calls.load(Ordering::SeqCst), 1);
+
+        let MockEnv { connection, .. } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_routing_strategy(strategy.clone()),
+            name,
+            make_handler(shards_calls.clone()),
+        );
+
+        assert_eq!(shards_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            connection
+                .connected_node_addresses()
+                .into_iter()
+                .map(|addr| addr.port())
+                .collect::<Vec<_>>(),
+            vec![6379, 6380]
+        );
     }
 
     #[test]
