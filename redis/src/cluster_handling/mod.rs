@@ -120,6 +120,18 @@ pub(crate) fn slot_cmd() -> Cmd {
     cmd
 }
 
+pub(crate) fn shard_cmd() -> Cmd {
+    let mut cmd = Cmd::new();
+    cmd.arg("CLUSTER").arg("SHARDS");
+    cmd
+}
+
+pub(crate) fn info_server_cmd() -> Cmd {
+    let mut cmd = Cmd::new();
+    cmd.arg("INFO").arg("SERVER");
+    cmd
+}
+
 pub(crate) fn split_node_address(node: &str) -> RedisResult<(&str, u16)> {
     let invalid_error =
         || RedisError::from((ErrorKind::InvalidClientConfig, "Invalid node string"));

@@ -68,11 +68,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use arcstr::ArcStr;
+
 mod pipeline;
 
 pub use super::NodeAddress;
 pub use super::client::{ClusterClient, ClusterClientBuilder};
-use super::topology::parse_slots;
+use super::topology::{
+    NodeAvailabilityZoneCoverage, NodeAvailabilityZoneDiscovery,
+    NodeAvailabilityZoneDiscoveryMethod, parse_cluster_shards_availability_zones,
+    parse_hostname_availability_zone, parse_info_server_availability_zone, parse_slots,
+};
 use super::{
     client::ClusterParams,
     read_routing::ReadRoutingStrategy,
@@ -81,7 +87,7 @@ use super::{
 };
 use crate::IntoConnectionInfo;
 pub use crate::TlsMode; // Pub for backwards compatibility
-use crate::cluster_handling::{get_connection_info, slot_cmd};
+use crate::cluster_handling::{get_connection_info, info_server_cmd, shard_cmd, slot_cmd};
 use crate::cluster_routing::{
     MultipleNodeRoutingInfo, ResponsePolicy, Routable, SingleNodeRoutingInfo, Slot, SlotAddr,
 };
@@ -323,6 +329,7 @@ pub struct ClusterConnection<C = Connection> {
     read_timeout: RefCell<Option<Duration>>,
     write_timeout: RefCell<Option<Duration>>,
     routing_strategy: Option<Box<dyn ReadRoutingStrategy>>,
+    az_discovery: RefCell<NodeAvailabilityZoneDiscovery>,
     cluster_params: ClusterParams,
 }
 
@@ -378,6 +385,7 @@ where
             read_timeout: RefCell::new(cluster_params.response_timeout),
             write_timeout: RefCell::new(None),
             routing_strategy,
+            az_discovery: RefCell::new(NodeAvailabilityZoneDiscovery::default()),
             initial_nodes: initial_nodes.to_vec(),
             cluster_params,
         };
@@ -516,24 +524,50 @@ where
 
     // Query a node to discover slot-> master mappings.
     fn refresh_slots(&self) -> RedisResult<()> {
-        let mut slots = self.slots.borrow_mut();
-        *slots = self.create_new_slots()?;
+        let mut new_slots = self.create_new_slots()?;
 
         if let Some(ref strategy) = self.routing_strategy {
-            strategy.on_topology_changed(slots.topology());
+            if strategy.requires_node_availability_zones() {
+                let zones = self.discover_node_availability_zones(&new_slots);
+                new_slots.set_node_availability_zones(zones);
+            }
+
+            let topology = new_slots.topology();
+            strategy.on_topology_changed(topology.clone());
+
+            let mut nodes = strategy
+                .eager_connection_nodes(&topology)
+                .unwrap_or_else(|| new_slots.values().flatten().cloned().collect());
+            let mut nodes = nodes.drain().collect::<Vec<_>>();
+            nodes.sort_unstable();
+            nodes.dedup();
+
+            *self.slots.borrow_mut() = new_slots;
+            self.refresh_connections(nodes);
+            return Ok(());
         }
 
-        let mut nodes = slots.values().flatten().collect::<Vec<_>>();
+        let mut nodes = new_slots.values().flatten().cloned().collect::<Vec<_>>();
         nodes.sort_unstable();
         nodes.dedup();
 
+        *self.slots.borrow_mut() = new_slots;
+        self.refresh_connections(nodes);
+
+        Ok(())
+    }
+
+    fn refresh_connections(&self, nodes: Vec<NodeAddress>) {
         let mut connections = self.connections.borrow_mut();
 
         // Build a work item per node, salvaging any existing connection so the
         // worker can try to reuse it before opening a fresh one.
         let mut work: Vec<(NodeAddress, Option<C>)> = nodes
             .into_iter()
-            .map(|addr| (addr.clone(), connections.remove(addr)))
+            .map(|addr| {
+                let connection = connections.remove(&addr);
+                (addr, connection)
+            })
             .collect();
         let node_count = work.len();
 
@@ -601,8 +635,6 @@ where
         }
 
         *connections = refreshed;
-
-        Ok(())
     }
 
     fn create_new_slots(&self) -> RedisResult<SlotMap> {
@@ -628,6 +660,177 @@ where
                 "Slot refresh error. didn't get any slots from server",
             ))),
         }
+    }
+
+    fn discover_node_availability_zones(
+        &self,
+        slots: &SlotMap,
+    ) -> std::collections::HashMap<NodeAddress, ArcStr> {
+        let nodes = Self::nodes_for_availability_zone_discovery(slots);
+        let mut best_zones = std::collections::HashMap::new();
+        let preferred_method = self.az_discovery.borrow().preferred_method();
+        if let Some(method) = preferred_method {
+            let zones = self.discover_node_availability_zones_with_method(method, slots);
+            if Self::zones_cover_all_nodes(&zones, &nodes) {
+                self.az_discovery.borrow_mut().record_success(method);
+                self.log_node_availability_zone_coverage(zones.len(), nodes.len());
+                return zones;
+            }
+            if !zones.is_empty() {
+                best_zones = zones;
+            }
+            self.az_discovery.borrow_mut().record_failure(method);
+        }
+
+        for method in NodeAvailabilityZoneDiscoveryMethod::ALL {
+            if Some(method) == preferred_method {
+                continue;
+            }
+            let zones = self.discover_node_availability_zones_with_method(method, slots);
+            if Self::zones_cover_all_nodes(&zones, &nodes) {
+                self.az_discovery.borrow_mut().record_success(method);
+                self.log_node_availability_zone_coverage(zones.len(), nodes.len());
+                return zones;
+            }
+            if zones.len() > best_zones.len() {
+                best_zones = zones;
+            }
+        }
+
+        self.log_node_availability_zone_coverage(best_zones.len(), nodes.len());
+        best_zones
+    }
+
+    fn log_node_availability_zone_coverage(&self, known_nodes: usize, total_nodes: usize) {
+        let coverage = NodeAvailabilityZoneCoverage::from_counts(known_nodes, total_nodes);
+        if !self.az_discovery.borrow_mut().should_log_coverage(coverage) {
+            return;
+        }
+
+        match coverage {
+            NodeAvailabilityZoneCoverage::None => {
+                log::info!(
+                    "Zonal read routing requested, but no availability-zone metadata could be discovered for any of {total_nodes} cluster nodes using CLUSTER SHARDS, hostname parsing, or INFO SERVER; falling back to non-zonal replica routing until metadata is available"
+                );
+            }
+            NodeAvailabilityZoneCoverage::Partial => {
+                log::info!(
+                    "Zonal read routing availability-zone metadata is incomplete ({known_nodes}/{total_nodes} cluster nodes); using known zone metadata where available and falling back to non-zonal replica routing for shards without a local replica"
+                );
+            }
+            NodeAvailabilityZoneCoverage::Complete => {
+                log::info!(
+                    "Zonal read routing availability-zone metadata discovery recovered ({known_nodes}/{total_nodes} cluster nodes); local replica preference is active for the current topology"
+                );
+            }
+        }
+    }
+
+    fn discover_node_availability_zones_with_method(
+        &self,
+        method: NodeAvailabilityZoneDiscoveryMethod,
+        slots: &SlotMap,
+    ) -> std::collections::HashMap<NodeAddress, ArcStr> {
+        match method {
+            NodeAvailabilityZoneDiscoveryMethod::ClusterShards => {
+                self.discover_node_availability_zones_with_cluster_shards()
+            }
+            NodeAvailabilityZoneDiscoveryMethod::InfoServer => {
+                self.discover_node_availability_zones_with_info_server(slots)
+            }
+            NodeAvailabilityZoneDiscoveryMethod::Hostname => {
+                self.discover_node_availability_zones_with_hostnames(slots)
+            }
+        }
+    }
+
+    fn nodes_for_availability_zone_discovery(slots: &SlotMap) -> Vec<NodeAddress> {
+        let mut nodes = slots.values().flatten().cloned().collect::<Vec<_>>();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    }
+
+    fn zones_cover_all_nodes(
+        zones: &std::collections::HashMap<NodeAddress, ArcStr>,
+        nodes: &[NodeAddress],
+    ) -> bool {
+        !nodes.is_empty() && nodes.iter().all(|node| zones.contains_key(node))
+    }
+
+    fn discover_node_availability_zones_with_cluster_shards(
+        &self,
+    ) -> std::collections::HashMap<NodeAddress, ArcStr> {
+        let mut connections = self.connections.borrow_mut();
+
+        for (addr, conn) in connections.iter_mut() {
+            let value = conn
+                .req_command(&shard_cmd())
+                .and_then(|value| value.extract_error());
+            if let Ok(value) = value {
+                let zones = parse_cluster_shards_availability_zones(&value, addr.host());
+                if !zones.is_empty() {
+                    return zones;
+                }
+            }
+        }
+
+        std::collections::HashMap::new()
+    }
+
+    fn discover_node_availability_zones_with_info_server(
+        &self,
+        slots: &SlotMap,
+    ) -> std::collections::HashMap<NodeAddress, ArcStr> {
+        let mut zones = std::collections::HashMap::new();
+        let mut nodes = slots.values().flatten().cloned().collect::<Vec<_>>();
+        nodes.sort_unstable();
+        nodes.dedup();
+
+        for node in nodes {
+            let zone = {
+                let mut connections = self.connections.borrow_mut();
+                connections
+                    .get_mut(&node)
+                    .and_then(Self::query_info_server_availability_zone)
+            };
+
+            let zone = match zone {
+                Some(zone) => Some(zone),
+                None => self
+                    .connect(&node)
+                    .ok()
+                    .and_then(|mut conn| Self::query_info_server_availability_zone(&mut conn)),
+            };
+
+            if let Some(zone) = zone {
+                zones.insert(node, zone);
+            }
+        }
+
+        zones
+    }
+
+    fn query_info_server_availability_zone(conn: &mut C) -> Option<ArcStr> {
+        let value = conn
+            .req_command(&info_server_cmd())
+            .and_then(|value| value.extract_error())
+            .ok()?;
+        let info = crate::from_redis_value::<String>(value).ok()?;
+        parse_info_server_availability_zone(&info)
+    }
+
+    fn discover_node_availability_zones_with_hostnames(
+        &self,
+        slots: &SlotMap,
+    ) -> std::collections::HashMap<NodeAddress, ArcStr> {
+        slots
+            .values()
+            .flat_map(|slot| slot.into_iter())
+            .filter_map(|addr| {
+                parse_hostname_availability_zone(addr.host()).map(|zone| (addr.clone(), zone))
+            })
+            .collect()
     }
 
     fn connect(&self, node: &NodeAddress) -> RedisResult<C> {

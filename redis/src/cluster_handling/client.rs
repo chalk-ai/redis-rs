@@ -6,7 +6,9 @@ use crate::auth::StreamingCredentialsProvider;
 use crate::caching::{CacheConfig, CacheManager};
 use crate::client::DEFAULT_CONNECTION_TIMEOUT;
 use crate::cluster_handling::NodeAddress;
-use crate::cluster_handling::read_routing::{RandomReplicaStrategy, ReadRoutingStrategyFactory};
+use crate::cluster_handling::read_routing::{
+    RandomReplicaStrategy, ReadRoutingStrategyFactory, ZonalReadRoutingStrategy,
+};
 
 /// A predicate that decides which replicas a `ClusterClient` connects to.
 ///
@@ -519,6 +521,23 @@ impl ClusterClientBuilder {
     ) -> ClusterClientBuilder {
         self.builder_params.read_routing_factory = Some(Arc::new(strategy));
         self
+    }
+
+    /// Routes reads to replicas in the caller's availability zone first.
+    ///
+    /// For each shard, read commands prefer replicas whose discovered
+    /// availability zone matches `availability_zone`. If a shard has no
+    /// matching replicas, reads fall back to that shard's other replicas, and
+    /// if the shard has no replicas the client falls back to the primary.
+    ///
+    /// The client discovers node availability zones during topology refresh
+    /// using supported cluster metadata such as `CLUSTER SHARDS`, `INFO SERVER`,
+    /// and hostname parsing.
+    pub fn read_from_zonal_replicas(
+        self,
+        availability_zone: impl Into<ArcStr>,
+    ) -> ClusterClientBuilder {
+        self.read_routing_strategy(ZonalReadRoutingStrategy::new(availability_zone))
     }
 
     /// Restricts which replicas this client connects to.

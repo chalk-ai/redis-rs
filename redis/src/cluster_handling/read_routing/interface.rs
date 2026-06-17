@@ -1,5 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+
+use arcstr::ArcStr;
 
 use super::super::NodeAddress;
 use super::super::slot_range_map::SlotRangeMap;
@@ -50,11 +53,19 @@ impl Shard {
 #[derive(Debug, Clone)]
 pub struct ClusterTopology {
     slots: SlotRangeMap<Arc<Shard>>,
+    node_availability_zones: Arc<HashMap<NodeAddress, ArcStr>>,
 }
 
 impl ClusterTopology {
     /// Build a topology from a list of shards.
     pub fn from_shards(shards: Vec<Shard>) -> Self {
+        Self::from_shards_with_node_availability_zones(shards, HashMap::new())
+    }
+
+    pub(crate) fn from_shards_with_node_availability_zones(
+        shards: Vec<Shard>,
+        node_availability_zones: HashMap<NodeAddress, ArcStr>,
+    ) -> Self {
         let mut slots = SlotRangeMap::new();
         for shard in shards {
             let shard = Arc::new(shard);
@@ -62,7 +73,10 @@ impl ClusterTopology {
                 slots.insert(start, end, Arc::clone(&shard));
             }
         }
-        Self { slots }
+        Self {
+            slots,
+            node_availability_zones: Arc::new(node_availability_zones),
+        }
     }
 
     /// Returns the shard that owns the given slot, or `None` if the slot
@@ -81,6 +95,19 @@ impl ClusterTopology {
                 None
             }
         })
+    }
+
+    /// Returns the availability zone known for a node, if topology discovery
+    /// provided one.
+    pub fn availability_zone_for_node(&self, node: &NodeAddress) -> Option<&str> {
+        self.node_availability_zones
+            .get(node)
+            .map(|zone| zone.as_str())
+    }
+
+    /// Returns all node availability zones carried by this topology snapshot.
+    pub fn node_availability_zones(&self) -> &HashMap<NodeAddress, ArcStr> {
+        &self.node_availability_zones
     }
 }
 
@@ -242,6 +269,16 @@ impl<'a> ReadCandidates<'a> {
 /// }
 /// ```
 pub trait ReadRoutingStrategy: Send + Sync {
+    /// Returns true when the strategy benefits from per-node availability-zone
+    /// metadata in [`ClusterTopology`].
+    ///
+    /// Strategies that return true allow the cluster connection to run
+    /// best-effort metadata discovery during topology refresh before
+    /// [`on_topology_changed`](Self::on_topology_changed) is called.
+    fn requires_node_availability_zones(&self) -> bool {
+        false
+    }
+
     /// Called when the connection discovers or refreshes the cluster topology.
     ///
     /// The [`ClusterTopology`] groups slot ranges into shards by primary node.
@@ -257,6 +294,17 @@ pub trait ReadRoutingStrategy: Send + Sync {
     /// hot path. Implementations should return quickly — offload any expensive or
     /// async work (e.g. spawning probe tasks) rather than blocking here.
     fn on_topology_changed(&self, _topology: ClusterTopology) {}
+
+    /// Returns the node connections this strategy wants the cluster connection
+    /// to maintain eagerly for the given topology.
+    ///
+    /// Returning `None` keeps the default behavior of connecting to every node
+    /// in the slot map. Strategies that can prove they will only route to a
+    /// subset may return that subset to reduce connection fan-out. The returned
+    /// set should include all primaries needed for writes.
+    fn eager_connection_nodes(&self, _topology: &ClusterTopology) -> Option<HashSet<NodeAddress>> {
+        None
+    }
 
     /// Choose which node within a shard to route a read command to.
     ///
