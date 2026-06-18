@@ -109,6 +109,20 @@ pub(crate) fn parse_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster_handling::read_routing::{ReadCandidates, ReadRoutingStrategy};
+    use crate::cluster_handling::slot_map::SlotMap;
+    use crate::cluster_routing::{Route, Slot, SlotAddr};
+
+    struct FirstReplicaStrategy;
+
+    impl ReadRoutingStrategy for FirstReplicaStrategy {
+        fn route_read<'a>(&self, candidates: &ReadCandidates<'a>) -> &'a NodeAddress {
+            match candidates {
+                ReadCandidates::AnyNode(c) => c.replicas().first(),
+                ReadCandidates::ReplicasOnly(c) => c.replicas().first(),
+            }
+        }
+    }
 
     fn slot_value_with_replicas(start: u16, end: u16, nodes: Vec<(&str, u16)>) -> Value {
         let mut node_values: Vec<Value> = nodes
@@ -185,5 +199,44 @@ mod tests {
 
         assert_eq!(slots[0].master, "p:6379");
         assert!(slots[0].replicas.is_empty());
+    }
+
+    #[test]
+    fn parse_slots_replica_filter_result_drives_replica_optional_routing() {
+        let strategy = FirstReplicaStrategy;
+        let route = Route::with_slot(Slot::new(50).unwrap(), SlotAddr::ReplicaOptional);
+
+        let slots_view = || {
+            Value::Array(vec![slot_value_with_replicas(
+                0,
+                100,
+                vec![
+                    ("primary-0001.example.cache.amazonaws.com", 6379),
+                    ("replica-0001.example.cache.amazonaws.com", 6379),
+                ],
+            )])
+        };
+
+        let keep_advertised_replica = |addr: &NodeAddress| {
+            addr.host() == "replica-0001.example.cache.amazonaws.com" && addr.port() == 6379
+        };
+        let slots = parse_slots(slots_view(), "answer", Some(&keep_advertised_replica)).unwrap();
+        let slot_map = SlotMap::from_slots(slots);
+        assert_eq!(
+            slot_map
+                .slot_addr_for_route(&route, Some(&strategy))
+                .unwrap(),
+            "replica-0001.example.cache.amazonaws.com:6379"
+        );
+
+        let drop_all_replicas = |_addr: &NodeAddress| false;
+        let slots = parse_slots(slots_view(), "answer", Some(&drop_all_replicas)).unwrap();
+        let slot_map = SlotMap::from_slots(slots);
+        assert_eq!(
+            slot_map
+                .slot_addr_for_route(&route, Some(&strategy))
+                .unwrap(),
+            "primary-0001.example.cache.amazonaws.com:6379"
+        );
     }
 }
