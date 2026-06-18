@@ -127,10 +127,9 @@ impl NodeAvailabilityZoneDiscoveryCache for NodeAvailabilityZoneDiscoveryState {
     fn should_log_coverage(&self, coverage: NodeAvailabilityZoneCoverage) -> bool {
         let mut state = self.state.write().expect("Lock poisoned");
         let previous = state.last_coverage.replace(coverage);
-        match (previous, coverage) {
-            (None, NodeAvailabilityZoneCoverage::Complete) => false,
-            (None, _) => true,
-            (Some(previous), current) => previous != current,
+        match previous {
+            None => true,
+            Some(previous) => previous != coverage,
         }
     }
 }

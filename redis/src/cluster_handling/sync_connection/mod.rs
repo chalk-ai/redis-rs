@@ -755,7 +755,7 @@ where
             }
             NodeAvailabilityZoneCoverage::Complete => {
                 log::info!(
-                    "Zonal read routing availability-zone metadata discovery recovered ({known_nodes}/{total_nodes} cluster nodes); local replica preference is active for the current topology"
+                    "Zonal read routing availability-zone metadata is complete ({known_nodes}/{total_nodes} cluster nodes); local replica preference is active for the current topology"
                 );
             }
         }

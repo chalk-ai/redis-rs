@@ -268,7 +268,7 @@ mod tests {
     fn shared_discovery_state_logs_only_important_coverage_transitions() {
         let cache = NodeAvailabilityZoneDiscoveryState::default();
 
-        assert!(!cache.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
+        assert!(cache.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
         assert!(!cache.should_log_coverage(NodeAvailabilityZoneCoverage::Complete));
         assert!(cache.should_log_coverage(NodeAvailabilityZoneCoverage::None));
         assert!(!cache.should_log_coverage(NodeAvailabilityZoneCoverage::None));
