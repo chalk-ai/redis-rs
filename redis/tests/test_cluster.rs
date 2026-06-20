@@ -13,7 +13,9 @@ mod cluster {
     use redis::{
         Commands, ConnectionLike, ErrorKind, RedisError, ServerErrorKind, Value,
         cluster::{ClusterClient, ClusterConnection, cluster_pipe},
-        cluster_read_routing::{RandomReplicaStrategy, RoundRobinReplicaStrategy},
+        cluster_read_routing::{
+            RandomReplicaStrategy, RoundRobinReplicaStrategy, ZonalReadRoutingStrategy,
+        },
         cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo, SingleNodeRoutingInfo},
         cmd, parse_redis_value,
     };
@@ -704,6 +706,281 @@ mod cluster {
             .collect::<Vec<_>>();
         assert_eq!(ports, vec![6379, 6382]);
         assert_eq!(connection.connected_node_count(), 2);
+    }
+
+    fn bulk(value: &str) -> Value {
+        Value::BulkString(value.as_bytes().to_vec())
+    }
+
+    fn cluster_shards_with_zones(
+        name: &str,
+        slots_config: &[MockSlotRange],
+        zones: &[(u16, &str)],
+    ) -> Value {
+        let zone_for_port = |port| {
+            zones
+                .iter()
+                .find_map(|(candidate_port, zone)| (*candidate_port == port).then_some(*zone))
+                .unwrap_or("unknown-zone")
+        };
+
+        Value::Array(
+            slots_config
+                .iter()
+                .map(|slot| {
+                    let mut nodes = vec![Value::Map(vec![
+                        (bulk("endpoint"), bulk(name)),
+                        (bulk("port"), Value::Int(slot.primary_port as i64)),
+                        (
+                            bulk("availability-zone"),
+                            bulk(zone_for_port(slot.primary_port)),
+                        ),
+                    ])];
+                    nodes.extend(slot.replica_ports.iter().map(|port| {
+                        Value::Map(vec![
+                            (bulk("endpoint"), bulk(name)),
+                            (bulk("port"), Value::Int(*port as i64)),
+                            (bulk("availability-zone"), bulk(zone_for_port(*port))),
+                        ])
+                    }));
+
+                    Value::Map(vec![
+                        (
+                            bulk("slots"),
+                            Value::Array(vec![
+                                Value::Int(slot.slot_range.start as i64),
+                                Value::Int(slot.slot_range.end as i64),
+                            ]),
+                        ),
+                        (bulk("nodes"), Value::Array(nodes)),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_cluster_zonal_read_routes_locally_and_prunes_remote_replica_connections() {
+        let name = "test_cluster_zonal_read_routes_locally_and_prunes_remote_replica_connections";
+        let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ports_clone = ports.clone();
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380, 6381],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ];
+        let zones = vec![
+            (6379, "us-east-1b"),
+            (6380, "us-east-1b"),
+            (6381, "us-east-1c"),
+            (6382, "us-east-1c"),
+            (6383, "us-east-1c"),
+            (6384, "us-east-1d"),
+        ];
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(0)
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(
+                        name,
+                        cmd,
+                        Some(slots_config.clone()),
+                    );
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(name, &slots_config, &zones)));
+                }
+                if contains_slice(cmd, b"GET") {
+                    ports_clone.lock().unwrap().push(port);
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        let connected_ports = connection
+            .connected_node_addresses()
+            .into_iter()
+            .map(|addr| addr.port())
+            .collect::<Vec<_>>();
+        assert_eq!(connected_ports, vec![6379, 6380, 6382, 6383, 6384]);
+
+        let _: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+        let _: Option<i32> = cmd("GET").arg("{foo}test").query(&mut connection).unwrap();
+        let _: Option<i32> = cmd("GET").arg("{foo}test").query(&mut connection).unwrap();
+
+        assert_eq!(ports.lock().unwrap().clone(), vec![6380, 6383, 6384]);
+    }
+
+    #[test]
+    fn test_cluster_zonal_read_reuses_info_server_discovery_results_after_refresh() {
+        let name = "test_cluster_zonal_read_reuses_info_server_discovery_results_after_refresh";
+        let shards_calls = Arc::new(atomic::AtomicUsize::new(0));
+        let shards_calls_clone = shards_calls.clone();
+        let info_calls = Arc::new(atomic::AtomicUsize::new(0));
+        let info_calls_clone = info_calls.clone();
+        let get_calls = Arc::new(atomic::AtomicUsize::new(0));
+        let get_calls_clone = get_calls.clone();
+        let slots_config = vec![MockSlotRange {
+            primary_port: 6379,
+            replica_ports: vec![6380, 6381],
+            slot_range: 0..16384,
+        }];
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(
+                        name,
+                        cmd,
+                        Some(slots_config.clone()),
+                    );
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    shards_calls_clone.fetch_add(1, atomic::Ordering::SeqCst);
+                    return Err(parse_redis_value(b"-ERR unknown command\r\n"));
+                }
+                if contains_slice(cmd, b"INFO") && contains_slice(cmd, b"SERVER") {
+                    info_calls_clone.fetch_add(1, atomic::Ordering::SeqCst);
+                    let zone = if port == 6380 {
+                        "us-east-1b"
+                    } else {
+                        "us-east-1c"
+                    };
+                    return Err(Ok(Value::BulkString(
+                        format!("# Server\r\navailability_zone:{zone}\r\n").into_bytes(),
+                    )));
+                }
+                if contains_slice(cmd, b"GET") {
+                    if get_calls_clone.fetch_add(1, atomic::Ordering::SeqCst) == 0 {
+                        return Err(parse_redis_value(b"-MOVED 123\r\n"));
+                    }
+                    assert_eq!(port, 6380);
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        let shards_calls_after_setup = shards_calls.load(atomic::Ordering::SeqCst);
+        let info_calls_after_setup = info_calls.load(atomic::Ordering::SeqCst);
+        assert!(shards_calls_after_setup >= 1);
+        assert!(info_calls_after_setup >= 3);
+        assert_eq!(
+            connection
+                .connected_node_addresses()
+                .into_iter()
+                .map(|addr| addr.port())
+                .collect::<Vec<_>>(),
+            vec![6379, 6380]
+        );
+
+        let value = cmd("GET").arg("test").query::<Option<i32>>(&mut connection);
+
+        assert_eq!(value, Ok(Some(123)));
+        assert_eq!(
+            shards_calls.load(atomic::Ordering::SeqCst),
+            shards_calls_after_setup
+        );
+        assert_eq!(
+            info_calls.load(atomic::Ordering::SeqCst),
+            info_calls_after_setup
+        );
+    }
+
+    #[test]
+    fn test_cluster_zonal_read_shared_strategy_reuses_discovered_az_metadata() {
+        let name = "test_cluster_zonal_read_shared_strategy_reuses_discovered_az_metadata";
+        let shards_calls = Arc::new(atomic::AtomicUsize::new(0));
+        let slots_config = vec![MockSlotRange {
+            primary_port: 6379,
+            replica_ports: vec![6380, 6381],
+            slot_range: 0..16384,
+        }];
+        let zones = vec![
+            (6379, "us-east-1b"),
+            (6380, "us-east-1b"),
+            (6381, "us-east-1c"),
+        ];
+        let strategy = ZonalReadRoutingStrategy::shared("us-east-1b");
+        let make_handler = {
+            let slots_config = slots_config.clone();
+            let zones = zones.clone();
+            move |shards_calls: Arc<atomic::AtomicUsize>| {
+                let slots_config = slots_config.clone();
+                let zones = zones.clone();
+                move |cmd: &[u8], _port| {
+                    if is_connection_check(cmd) {
+                        return Err(Ok(redis_value!(simple:"OK")));
+                    }
+                    if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                        return respond_startup_with_replica_using_config(
+                            name,
+                            cmd,
+                            Some(slots_config.clone()),
+                        );
+                    }
+                    if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                        shards_calls.fetch_add(1, Ordering::SeqCst);
+                        return Err(Ok(cluster_shards_with_zones(name, &slots_config, &zones)));
+                    }
+                    Ok(())
+                }
+            }
+        };
+
+        let _first = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_routing_strategy(strategy.clone()),
+            name,
+            make_handler(shards_calls.clone()),
+        );
+        assert_eq!(shards_calls.load(Ordering::SeqCst), 1);
+
+        let MockEnv { connection, .. } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_routing_strategy(strategy.clone()),
+            name,
+            make_handler(shards_calls.clone()),
+        );
+
+        assert_eq!(shards_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            connection
+                .connected_node_addresses()
+                .into_iter()
+                .map(|addr| addr.port())
+                .collect::<Vec<_>>(),
+            vec![6379, 6380]
+        );
     }
 
     #[test]

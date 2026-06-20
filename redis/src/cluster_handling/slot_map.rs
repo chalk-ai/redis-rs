@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use arcstr::ArcStr;
 
 use super::NodeAddress;
 use super::read_routing::{ClusterTopology, ReadCandidates, ReadRoutingStrategy, Replicas, Shard};
@@ -10,12 +12,14 @@ pub(crate) const SLOT_SIZE: u16 = 16384;
 #[derive(Debug, Default)]
 pub(crate) struct SlotMap {
     slots: SlotRangeMap<SlotAddrs>,
+    node_availability_zones: HashMap<NodeAddress, ArcStr>,
 }
 
 impl SlotMap {
     pub fn new() -> Self {
         Self {
             slots: Default::default(),
+            node_availability_zones: Default::default(),
         }
     }
 
@@ -24,7 +28,10 @@ impl SlotMap {
         for slot in slots {
             map.insert(slot.start, slot.end, SlotAddrs::from_slot(slot));
         }
-        Self { slots: map }
+        Self {
+            slots: map,
+            node_availability_zones: Default::default(),
+        }
     }
 
     #[cfg(feature = "cluster-async")]
@@ -53,6 +60,13 @@ impl SlotMap {
 
     pub fn values(&self) -> impl Iterator<Item = &SlotAddrs> {
         self.slots.values()
+    }
+
+    pub(crate) fn set_node_availability_zones(
+        &mut self,
+        node_availability_zones: HashMap<NodeAddress, ArcStr>,
+    ) {
+        self.node_availability_zones = node_availability_zones;
     }
 
     fn all_unique_addresses(&self, only_primaries: bool) -> HashSet<&NodeAddress> {
@@ -109,11 +123,12 @@ impl SlotMap {
             }
         }
 
-        ClusterTopology::from_shards(
+        ClusterTopology::from_shards_with_node_availability_zones(
             builders
                 .into_iter()
                 .map(|b| Shard::new(b.slot_ranges, b.primary, b.replicas))
                 .collect(),
+            self.node_availability_zones.clone(),
         )
     }
 }
@@ -585,6 +600,28 @@ mod tests {
         assert_eq!(shard.primary(), &addr("node2:6379"));
 
         assert!(topo.shard_for_slot(5000).is_none());
+    }
+
+    #[test]
+    fn test_slot_map_topology_carries_node_availability_zones() {
+        let mut slot_map = SlotMap::from_slots(vec![SlotRange::new(
+            0,
+            100,
+            addr("primary:6379"),
+            vec![addr("replica:6379")],
+        )]);
+        slot_map.set_node_availability_zones(
+            [(addr("replica:6379"), ArcStr::from("us-east-1b"))]
+                .into_iter()
+                .collect(),
+        );
+
+        let topo = slot_map.topology();
+
+        assert_eq!(
+            topo.availability_zone_for_node(&addr("replica:6379")),
+            Some("us-east-1b")
+        );
     }
 
     #[test]

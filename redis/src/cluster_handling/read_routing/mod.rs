@@ -14,10 +14,14 @@
 mod interface;
 mod random_replica;
 mod round_robin_replica;
+mod zonal_read_routing;
 
 pub use interface::{
-    AnyNodeCandidates, ClusterTopology, ReadCandidates, ReadRoutingStrategy,
+    AnyNodeCandidates, ClusterTopology, NodeAvailabilityZoneCoverage,
+    NodeAvailabilityZoneDiscoveryCache, NodeAvailabilityZoneDiscoveryMethod,
+    NodeAvailabilityZoneDiscoveryState, ReadCandidates, ReadRoutingStrategy,
     ReadRoutingStrategyFactory, Replicas, ReplicasOnlyCandidates, Shard,
 };
 pub use random_replica::RandomReplicaStrategy;
 pub use round_robin_replica::RoundRobinReplicaStrategy;
+pub use zonal_read_routing::ZonalReadRoutingStrategy;

@@ -1338,6 +1338,125 @@ mod cluster_async {
         assert_eq!(recorded, vec![6380, 6383, 6381, 6384, 6380, 6383]);
     }
 
+    fn bulk(value: &str) -> Value {
+        Value::BulkString(value.as_bytes().to_vec())
+    }
+
+    fn cluster_shards_with_zones(
+        name: &str,
+        slots_config: &[MockSlotRange],
+        zones: &[(u16, &str)],
+    ) -> Value {
+        let zone_for_port = |port| {
+            zones
+                .iter()
+                .find_map(|(candidate_port, zone)| (*candidate_port == port).then_some(*zone))
+                .unwrap_or("unknown-zone")
+        };
+
+        Value::Array(
+            slots_config
+                .iter()
+                .map(|slot| {
+                    let mut nodes = vec![Value::Map(vec![
+                        (bulk("endpoint"), bulk(name)),
+                        (bulk("port"), Value::Int(slot.primary_port as i64)),
+                        (
+                            bulk("availability-zone"),
+                            bulk(zone_for_port(slot.primary_port)),
+                        ),
+                    ])];
+                    nodes.extend(slot.replica_ports.iter().map(|port| {
+                        Value::Map(vec![
+                            (bulk("endpoint"), bulk(name)),
+                            (bulk("port"), Value::Int(*port as i64)),
+                            (bulk("availability-zone"), bulk(zone_for_port(*port))),
+                        ])
+                    }));
+
+                    Value::Map(vec![
+                        (
+                            bulk("slots"),
+                            Value::Array(vec![
+                                Value::Int(slot.slot_range.start as i64),
+                                Value::Int(slot.slot_range.end as i64),
+                            ]),
+                        ),
+                        (bulk("nodes"), Value::Array(nodes)),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_async_cluster_zonal_read_routes_locally_and_falls_back_to_remote_replicas() {
+        let name = "test_async_cluster_zonal_read_routes_locally_and_falls_back_to_remote_replicas";
+        let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ports_clone = ports.clone();
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380, 6381],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ];
+        let zones = vec![
+            (6379, "us-east-1b"),
+            (6380, "us-east-1b"),
+            (6381, "us-east-1c"),
+            (6382, "us-east-1c"),
+            (6383, "us-east-1c"),
+            (6384, "us-east-1d"),
+        ];
+
+        let MockEnv {
+            runtime,
+            async_connection: mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(0)
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(
+                        name,
+                        cmd,
+                        Some(slots_config.clone()),
+                    );
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(name, &slots_config, &zones)));
+                }
+                if contains_slice(cmd, b"GET") {
+                    ports_clone.lock().unwrap().push(port);
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        for key in ["test", "{foo}test", "{foo}test"] {
+            let _: Option<i32> = runtime
+                .block_on(cmd("GET").arg(key).query_async(&mut connection))
+                .unwrap();
+        }
+
+        let recorded = ports.lock().unwrap().clone();
+        assert_eq!(recorded, vec![6380, 6383, 6384]);
+    }
+
     fn test_async_cluster_fan_out(
         name: &'static str,
         command: &'static str,
