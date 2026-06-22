@@ -12,7 +12,7 @@ use crate::cluster_handling::NodeAddress;
 use crate::cluster_handling::slot_range_map::SlotRangeMap;
 
 struct ShardRoutingState {
-    local_replicas: HashSet<NodeAddress>,
+    local_replica_indices: Vec<usize>,
     counter: AtomicUsize,
 }
 
@@ -93,18 +93,19 @@ impl ReadRoutingStrategy for ZonalReadRoutingStrategy {
     fn on_topology_changed(&self, topology: ClusterTopology) {
         let mut slots = SlotRangeMap::new();
         for shard in topology.shards() {
-            let local_replicas = shard
+            let local_replica_indices = shard
                 .replicas()
                 .iter()
-                .filter(|replica| {
+                .enumerate()
+                .filter_map(|(idx, replica)| {
                     topology
                         .availability_zone_for_node(replica)
                         .is_some_and(|zone| zone == self.availability_zone.as_str())
+                        .then_some(idx)
                 })
-                .cloned()
                 .collect();
             let state = Arc::new(ShardRoutingState {
-                local_replicas,
+                local_replica_indices,
                 counter: AtomicUsize::new(0),
             });
             for &(start, end) in shard.slot_ranges() {
@@ -155,17 +156,12 @@ impl ReadRoutingStrategy for ZonalReadRoutingStrategy {
 
         if let Some(shard_state) = shard_state {
             let idx = shard_state.counter.fetch_add(1, Ordering::Relaxed);
-            let local_len = replicas
-                .iter()
-                .filter(|replica| shard_state.local_replicas.contains(*replica))
-                .count();
+            let local_len = shard_state.local_replica_indices.len();
             if local_len > 0 {
-                let target_idx = idx % local_len;
-                return replicas
-                    .iter()
-                    .filter(|replica| shard_state.local_replicas.contains(*replica))
-                    .nth(target_idx)
-                    .expect("local replica exists");
+                let target_idx = shard_state.local_replica_indices[idx % local_len];
+                if let Some(replica) = replicas.get(target_idx) {
+                    return replica;
+                }
             }
 
             return replicas
