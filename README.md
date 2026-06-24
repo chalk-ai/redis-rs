@@ -269,6 +269,34 @@ be an empty `Vec`. If you want to handle deserialization and `Vec` unwrapping au
 you can use the `Json` wrapper from the
 [redis-macros](https://github.com/daniel7grant/redis-macros/#json-wrapper-with-redisjson) crate.
 
+## Debugging: logging commands
+
+For ad-hoc debugging you can have the client mirror every command it sends, in a
+fashion similar to redis' `MONITOR`, by setting either (or both) of these
+environment variables. No code or feature-flag changes are required, and both
+the synchronous and async (multiplexed) connections are covered.
+
+* `REDIS_COMMAND_LOG_PATH` — a **directory**. Each connection opens its own
+  randomly-named file (`redis-commands-<uuid>.log`) inside it and appends a
+  `MONITOR`-style line per command:
+
+  ```text
+  1718000000.123456 "SET" "foo" "bar"
+  ```
+
+* `REDIS_COMMAND_TEE` — a `host:port` UDP endpoint. Each command is additionally
+  sent as a single UDP datagram of the form `<client uuid>:<unix time>: <command>`,
+  which you can capture with e.g. `nc -u -l 9999`. If no port is given, `9999` is
+  used.
+
+  ```text
+  01234567-89ab-cdef-0123-456789abcdef:1718000000.123456: "SET" "foo" "bar"
+  ```
+
+Logging is best-effort and never fails a real request. Commands issued during
+connection setup (e.g. `AUTH`/`HELLO`) are intentionally **not** logged, so
+credentials don't end up in the logs.
+
 ## Testing
  
  The [`redis-test`](https://docs.rs/redis-test) crate provides tools for testing Redis clients.
