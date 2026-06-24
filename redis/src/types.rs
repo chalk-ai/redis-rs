@@ -558,7 +558,7 @@ impl Value {
         }
     }
 
-    #[cfg(feature = "cluster-async")]
+    #[cfg(any(feature = "cluster", feature = "cluster-async"))]
     pub(crate) fn is_error_that_requires_action(&self) -> bool {
         matches!(self, Self::ServerError(error) if error.requires_action())
     }
