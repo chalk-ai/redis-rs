@@ -92,7 +92,9 @@ impl cluster::Connect for MockConnection {
     }
 
     fn recv_response(&mut self) -> RedisResult<Value> {
-        Ok(Value::Nil)
+        // Drive responses from the handler so cluster-pipeline tests can inject inline per-command replies (e.g. `MOVED`).
+        // Invoked only by the cluster pipeline receive path. Only supports differentiating response based on port
+        (self.handler)(&[], self.port).expect_err("Handler did not specify a response")
     }
 }
 
