@@ -494,6 +494,50 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_moved_redirect() {
+        // A `MOVED` returned for a pipelined sub-command is delivered
+        // inline as `Ok(Value::ServerError(Moved))`, and must be followed per command
+        //
+        // Both commands target the same slot, so they are sent as one sub-pipeline to the initial owner,
+        // which reports the slot has moved.
+        let name = "test_cluster_pipeline_moved_redirect";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], port| {
+            respond_startup(name, cmd)?;
+
+            if port == 6379 {
+                // Initial slot owner reports the slot moved. For the pipelined sub-commands
+                // this reply is returned via `recv_response` (cmd == &[]).
+                return Err(parse_redis_value(
+                    format!("-MOVED 123 {name}:6380\r\n").as_bytes(),
+                ));
+            }
+
+            // Redirect target serves the individually retried commands.
+            assert_eq!(port, 6380);
+            if contains_slice(cmd, b"GET") {
+                Err(Ok(redis_value!("val1")))
+            } else {
+                Err(Ok(redis_value!(simple: "OK")))
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("SET")
+            .arg("key1")
+            .arg("val1")
+            .cmd("GET")
+            .arg("key1")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["OK".to_string(), "val1".to_string()]));
+    }
+
+    #[test]
     fn test_cluster_ask_redirect() {
         let name = "test_cluster_ask_redirect";
         let completed = Arc::new(AtomicI32::new(0));

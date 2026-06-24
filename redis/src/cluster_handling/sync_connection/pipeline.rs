@@ -1,6 +1,7 @@
-use super::ClusterConnection;
+use super::{ClusterConnection, Connect};
 use crate::RedisError;
 use crate::cmd::{Cmd, cmd};
+use crate::connection::ConnectionLike;
 use crate::errors::ErrorKind;
 use crate::types::{FromRedisValue, HashSet, RedisResult, ToRedisArgs, Value, from_redis_value};
 
@@ -104,7 +105,10 @@ impl ClusterPipeline {
     ///     .cmd("GET").arg("key_2").query(&mut con).unwrap();
     /// ```
     #[inline]
-    pub fn query<T: FromRedisValue>(&self, con: &mut ClusterConnection) -> RedisResult<T> {
+    pub fn query<T: FromRedisValue>(
+        &self,
+        con: &mut ClusterConnection<impl ConnectionLike + Connect + Send>,
+    ) -> RedisResult<T> {
         for cmd in &self.commands {
             let cmd_name = std::str::from_utf8(cmd.arg_idx(0).unwrap_or(b""))
                 .unwrap_or("")
@@ -132,7 +136,10 @@ impl ClusterPipeline {
     /// this is useful for "SET" commands for which the response's content is not important.
     /// It avoids the need to define generic bounds for ().
     #[inline]
-    pub fn exec(&self, con: &mut ClusterConnection) -> RedisResult<()> {
+    pub fn exec(
+        &self,
+        con: &mut ClusterConnection<impl ConnectionLike + Connect + Send>,
+    ) -> RedisResult<()> {
         self.query::<()>(con)
     }
 }

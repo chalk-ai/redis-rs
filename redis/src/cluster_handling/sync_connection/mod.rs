@@ -1338,6 +1338,11 @@ where
                     .get_connection_by_addr(&mut connections, &nc.addr)?
                     .recv_response()
                 {
+                    // The RESP parser reports server errors as
+                    // `Ok(Value::ServerError(_))` rather than `Err`.
+                    // A pipelined sub-command that gets a redirect/retryable error
+                    // needs to be processed in the Ok arm and retried
+                    Ok(item) if item.is_error_that_requires_action() => to_retry.push(*cmd_idx),
                     Ok(item) => results[*cmd_idx] = item,
                     Err(err) if err.is_cluster_error() => to_retry.push(*cmd_idx),
                     Err(err) => first_err = first_err.or(Some(err)),
