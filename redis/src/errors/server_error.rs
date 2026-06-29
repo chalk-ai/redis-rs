@@ -120,7 +120,7 @@ impl ServerError {
         }
     }
 
-    #[cfg(feature = "cluster-async")]
+    #[cfg(any(feature = "cluster", feature = "cluster-async"))]
     pub(crate) fn requires_action(&self) -> bool {
         !matches!(
             self.kind()
