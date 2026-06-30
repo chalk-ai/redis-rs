@@ -844,6 +844,10 @@ pub struct Connection {
     /// The number of messages that are expected to be returned from the server,
     /// but the user no longer waits for - answers for requests that already returned a transient error.
     messages_to_skip: usize,
+
+    /// Optional environment-driven command logger (see [`crate::command_logger`]).
+    /// `None` unless `REDIS_COMMAND_LOG_PATH` or `REDIS_COMMAND_TEE` is set.
+    command_logger: Option<crate::command_logger::CommandLogger>,
 }
 
 /// Represents a RESP2 pubsub connection.
@@ -1559,6 +1563,7 @@ fn setup_connection(
         protocol: connection_info.protocol,
         push_sender: None,
         messages_to_skip: 0,
+        command_logger: None,
     };
 
     if execute_connection_pipeline(
@@ -1581,6 +1586,10 @@ fn setup_connection(
             ),
         )?;
     }
+
+    // Enable command logging only after the auth/setup pipeline has run, so that
+    // credentials sent during HELLO/AUTH are not written to the log.
+    rv.command_logger = crate::command_logger::CommandLogger::for_new_connection();
 
     Ok(rv)
 }
@@ -1901,6 +1910,9 @@ impl Connection {
     fn send_bytes(&mut self, bytes: &[u8]) -> RedisResult<Value> {
         if bytes.is_empty() {
             return Err(RedisError::make_empty_command());
+        }
+        if let Some(logger) = &self.command_logger {
+            logger.log(bytes);
         }
         let result = self.con.send_bytes(bytes);
         if self.protocol.supports_resp3() {
