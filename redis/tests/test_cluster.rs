@@ -520,7 +520,7 @@ mod cluster {
                 ));
             }
 
-            // Redirect target serves the individually retried commands.
+            // Redirect target serves the retried pipeline.
             assert_eq!(port, 6380);
             if contains_slice(cmd, b"GET") {
                 Err(Ok(redis_value!("val1")))
@@ -538,6 +538,211 @@ mod cluster {
             .query::<Vec<String>>(&mut connection);
 
         assert_eq!(value, Ok(vec!["OK".to_string(), "val1".to_string()]));
+    }
+
+    /// CRC16("x") % 16384, i.e. the slot every `{x}...` key routes to. Owned by
+    /// 6379 under `respond_startup`.
+    const X_TAG_SLOT: u16 = 16287;
+
+    #[test]
+    fn test_cluster_pipeline_moved_is_retried_as_one_pipeline() {
+        // The commands displaced by a reshard are re-sent as a new pipeline, so a
+        // pipeline of N commands that all move costs one extra round trip rather
+        // than N single-command requests.
+        let name = "test_cluster_pipeline_moved_is_retried_as_one_pipeline";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], port| {
+            respond_startup(name, cmd)?;
+
+            match port {
+                // The old owner reports the whole slot moved.
+                6379 => Err(parse_redis_value(
+                    format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                )),
+                6380 => {
+                    if contains_slice(cmd, b"GET") {
+                        Err(Ok(redis_value!("val1")))
+                    } else {
+                        Err(Ok(redis_value!(simple: "OK")))
+                    }
+                }
+                _ => panic!("Wrong node"),
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("SET")
+            .arg("{x}key1")
+            .arg("val1")
+            .cmd("SET")
+            .arg("{x}key2")
+            .arg("val2")
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(
+            value,
+            Ok(vec!["OK".to_string(), "OK".to_string(), "val1".to_string()])
+        );
+        // One three-command write to the old owner, then one three-command write
+        // to the new one. Retrying command by command would leave the retries out
+        // of this list entirely, since those go through `req_command`.
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 3), (6380, 3)]);
+    }
+
+    #[test]
+    fn test_cluster_pipeline_retries_only_the_commands_that_failed() {
+        // A pipeline that straddles two nodes and gets a redirect from one of them
+        // re-sends only that node's commands.
+        let name = "test_cluster_pipeline_retries_only_the_commands_that_failed";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], port| {
+            respond_startup_two_nodes(name, cmd)?;
+
+            match port {
+                // 6379 owns `{lo}a`'s slot and reports it moved to 6380.
+                6379 => Err(parse_redis_value(
+                    format!("-MOVED 4878 {name}:6380\r\n").as_bytes(),
+                )),
+                // 6380 owns `{hi}a` outright, and serves `{lo}a` after the redirect.
+                6380 if contains_slice(cmd, b"{hi}a") => Err(Ok(redis_value!("hi"))),
+                6380 => Err(Ok(redis_value!("lo"))),
+                _ => panic!("Wrong node"),
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{lo}a")
+            .cmd("GET")
+            .arg("{hi}a")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["lo".to_string(), "hi".to_string()]));
+
+        let mut writes = take_pipeline_writes(name);
+        // The retry is the last write: one command, the only one that moved.
+        assert_eq!(writes.pop(), Some((6380, 1)));
+        // The initial fan-out is one command per node, in unspecified node order.
+        writes.sort();
+        assert_eq!(writes, vec![(6379, 1), (6380, 1)]);
+    }
+
+    #[test]
+    fn test_cluster_pipeline_ask_redirect_asks_inside_the_retry_pipeline() {
+        // `ASKING` only covers the command that immediately follows it, so a
+        // retried pipeline has to carry one per redirected command rather than one
+        // per pipe.
+        let name = "test_cluster_pipeline_ask_redirect_asks_inside_the_retry_pipeline";
+        let asking = Arc::new(atomic::AtomicUsize::new(0));
+        let preceded_by_asking = Arc::new(atomic::AtomicBool::new(false));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let asking = asking.clone();
+            let preceded_by_asking = preceded_by_asking.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    // The slot is migrating away from 6379, key by key.
+                    6379 => Err(parse_redis_value(
+                        format!("-ASK {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6380 => {
+                        if contains_slice(cmd, b"ASKING") {
+                            asking.fetch_add(1, Ordering::SeqCst);
+                            preceded_by_asking.store(true, Ordering::SeqCst);
+                            return Err(Ok(redis_value!(simple: "OK")));
+                        }
+                        // Each redirected command must arrive right behind its own
+                        // ASKING, not behind one the previous command consumed.
+                        assert!(
+                            preceded_by_asking.swap(false, Ordering::SeqCst),
+                            "{cmd:?} reached the migration target without an ASKING"
+                        );
+                        Err(Ok(redis_value!("migrated")))
+                    }
+                    _ => panic!("Wrong node"),
+                }
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(
+            value,
+            Ok(vec!["migrated".to_string(), "migrated".to_string()])
+        );
+        assert_eq!(asking.load(Ordering::SeqCst), 2);
+        // The retry pipe carries two commands and the two `ASKING`s in front of them.
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 2), (6380, 4)]);
+
+        // An ASK does not transfer ownership of the slot, so the next pipeline
+        // still starts at 6379.
+        let _ = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+        assert_eq!(take_pipeline_writes(name).first(), Some(&(6379, 1)));
+    }
+
+    #[test]
+    fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
+        // A redirect the client can never satisfy is retried as a pipeline the
+        // configured number of times, then reported.
+        let name = "test_cluster_pipeline_gives_up_after_the_configured_retries";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")]).retries(2),
+            name,
+            move |cmd: &[u8], _| {
+                respond_startup(name, cmd)?;
+                // A MOVED with no address to redirect to: nothing to learn, and
+                // nowhere else to send the commands.
+                Err(parse_redis_value(
+                    format!("-MOVED {X_TAG_SLOT}\r\n").as_bytes(),
+                ))
+            },
+        );
+
+        let result = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .query::<Vec<String>>(&mut connection);
+
+        assert!(
+            matches!(&result, Err(err) if err.kind() == ServerErrorKind::Moved.into()),
+            "{result:?}",
+        );
+        // The initial attempt plus two retries, each one still a single pipeline.
+        assert_eq!(
+            take_pipeline_writes(name),
+            vec![(6379, 2), (6379, 2), (6379, 2)]
+        );
     }
 
     /// CRC16("test") % 16384, i.e. the slot `GET test` routes to. Owned by 6379

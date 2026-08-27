@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, LazyLock, RwLock},
     time::Duration,
 };
@@ -24,10 +24,40 @@ type Handler = Arc<dyn Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send +
 
 static HANDLERS: LazyLock<RwLock<HashMap<String, Handler>>> = LazyLock::new(Default::default);
 
+/// One packed write: the port it went to, and how many commands it carried.
+type PipelineWrite = (u16, usize);
+
+/// Every packed write the sync cluster pipeline path has made, per mock cluster
+/// name.
+static PIPELINE_WRITES: LazyLock<RwLock<HashMap<String, Vec<PipelineWrite>>>> =
+    LazyLock::new(Default::default);
+
+/// Take the packed pipeline writes recorded for `name` since the last call, in
+/// the order they were written, as `(port, commands in that write)`.
+///
+/// There is one entry per `send_packed_command`, so a pipeline that is retried
+/// as a pipeline shows up as a single wide write, while one retried command by
+/// command would not show up here at all: single-command requests go through
+/// `req_command` instead.
+pub fn take_pipeline_writes(name: &str) -> Vec<PipelineWrite> {
+    PIPELINE_WRITES
+        .write()
+        .unwrap()
+        .remove(name)
+        .unwrap_or_default()
+}
+
 #[derive(Clone)]
 pub struct MockConnection {
     pub handler: Handler,
     pub port: u16,
+    /// The mock cluster this connection belongs to, used to record its writes.
+    name: String,
+    /// Commands written by `send_packed_command` that `recv_response` has not
+    /// handed back yet. The cluster pipeline path writes a whole pipe and then
+    /// reads one response per command, so replaying the commands in order lets a
+    /// handler see which command each response belongs to.
+    pending: VecDeque<Vec<u8>>,
 }
 
 #[cfg(feature = "cluster-async")]
@@ -53,6 +83,8 @@ impl cluster_async::Connect for MockConnection {
                 .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
                 .clone(),
             port,
+            name: name.clone(),
+            pending: VecDeque::new(),
         }))
     }
 }
@@ -76,10 +108,20 @@ impl cluster::Connect for MockConnection {
                 .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
                 .clone(),
             port,
+            name: name.clone(),
+            pending: VecDeque::new(),
         })
     }
 
-    fn send_packed_command(&mut self, _cmd: &[u8]) -> RedisResult<()> {
+    fn send_packed_command(&mut self, cmd: &[u8]) -> RedisResult<()> {
+        let commands = split_packed_commands(cmd);
+        PIPELINE_WRITES
+            .write()
+            .unwrap()
+            .entry(self.name.clone())
+            .or_default()
+            .push((self.port, commands.len()));
+        self.pending.extend(commands);
         Ok(())
     }
 
@@ -93,9 +135,52 @@ impl cluster::Connect for MockConnection {
 
     fn recv_response(&mut self) -> RedisResult<Value> {
         // Drive responses from the handler so cluster-pipeline tests can inject inline per-command replies (e.g. `MOVED`).
-        // Invoked only by the cluster pipeline receive path. Only supports differentiating response based on port
-        (self.handler)(&[], self.port).expect_err("Handler did not specify a response")
+        // Invoked only by the cluster pipeline receive path. The command replayed
+        // here is the one this response answers, so handlers can branch on the
+        // command as well as on the port.
+        let cmd = self.pending.pop_front().unwrap_or_default();
+        (self.handler)(&cmd, self.port).expect_err("Handler did not specify a response")
     }
+}
+
+/// Split a packed pipeline back into the commands that were written into it.
+///
+/// The cluster pipeline path packs many commands into a single write and then
+/// reads the responses one at a time, so the mock has to undo the packing to
+/// pair each response with its command.
+fn split_packed_commands(buf: &[u8]) -> Vec<Vec<u8>> {
+    fn read_line(buf: &[u8]) -> Option<(&[u8], &[u8])> {
+        let end = buf.windows(2).position(|window| window == b"\r\n")?;
+        Some((&buf[..end], &buf[end + 2..]))
+    }
+
+    fn read_len(buf: &[u8], prefix: u8) -> Option<(usize, &[u8])> {
+        let (line, rest) = read_line(buf)?;
+        let digits = line.strip_prefix(&[prefix])?;
+        let len = std::str::from_utf8(digits).ok()?.parse().ok()?;
+        Some((len, rest))
+    }
+
+    let mut cmds = Vec::new();
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let start = rest;
+        let Some((args, after_header)) = read_len(rest, b'*') else {
+            break;
+        };
+        rest = after_header;
+        for _ in 0..args {
+            let Some((len, after_len)) = read_len(rest, b'$') else {
+                return cmds;
+            };
+            if after_len.len() < len + 2 {
+                return cmds;
+            }
+            rest = &after_len[len + 2..];
+        }
+        cmds.push(start[..start.len() - rest.len()].to_vec());
+    }
+    cmds
 }
 
 pub fn contains_slice(xs: &[u8], ys: &[u8]) -> bool {

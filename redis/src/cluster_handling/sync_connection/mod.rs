@@ -1139,23 +1139,37 @@ where
         }
     }
 
-    fn map_cmds_to_nodes(&self, cmds: &[Cmd]) -> RedisResult<Vec<NodeCmd>> {
+    /// Group the `pending` commands into one pipeline per node.
+    ///
+    /// A pending command carries the redirect, if any, that the previous attempt
+    /// told us to follow. That redirect wins over the slot map, and an `ASK`
+    /// redirect also gets an `ASKING` written into the pipe immediately before
+    /// the command it applies to.
+    fn map_cmds_to_nodes(&self, cmds: &[Cmd], pending: &[PendingCmd]) -> RedisResult<Vec<NodeCmd>> {
         let mut cmd_map: HashMap<NodeAddress, NodeCmd> = HashMap::new();
 
-        for (idx, cmd) in cmds.iter().enumerate() {
-            let addr = self.get_addr_for_cmd(cmd)?;
+        for pending_cmd in pending {
+            let cmd = &cmds[pending_cmd.idx];
+            let (addr, is_asking) = match &pending_cmd.redirect {
+                Some(Redirect::Moved(addr)) => (addr.clone(), false),
+                Some(Redirect::Ask(addr)) => (addr.clone(), true),
+                None => (self.get_addr_for_cmd(cmd)?, false),
+            };
             let nc = cmd_map
                 .entry(addr.clone())
                 .or_insert_with(|| NodeCmd::new(addr));
-            nc.indexes.push(idx);
+            if is_asking {
+                // `ASKING` only covers the command that immediately follows it, so
+                // it is written once per redirected command rather than once per
+                // pipe, and it adds a response that nothing is waiting for.
+                nc.pipe.extend_from_slice(ASKING);
+                nc.responses.push(None);
+            }
+            nc.responses.push(Some(pending_cmd.idx));
             cmd.write_packed_command(&mut nc.pipe);
         }
 
-        let mut result = Vec::new();
-        for (_, v) in cmd_map.drain() {
-            result.push(v);
-        }
-        Ok(result)
+        Ok(cmd_map.into_values().collect())
     }
 
     fn execute_on_all(
@@ -1442,7 +1456,7 @@ where
                         // ASKING command into the connection before what we
                         // actually want to execute.
                         conn = conn.and_then(|conn| {
-                            conn.req_packed_command(&b"*1\r\n$6\r\nASKING\r\n"[..])
+                            conn.req_packed_command(ASKING)
                                 .and_then(|value| value.extract_error())?;
                             Ok(conn)
                         });
@@ -1598,72 +1612,178 @@ where
         }
     }
 
+    /// Run every command in `cmds` and collect the responses in the caller's order.
+    ///
+    /// The commands are grouped into one pipeline per node and sent as a batch.
+    /// Whatever comes back asking to be retried is regrouped and re-sent as a
+    /// *new pipeline*, so a reshard that displaces `N` commands costs one extra
+    /// round trip per node rather than `N` sequential single-command requests.
     fn send_recv_and_retry_cmds(&self, cmds: &[Cmd]) -> RedisResult<Vec<Value>> {
         // Vector to hold the results, pre-populated with `Nil` values. This allows the original
         // cmd ordering to be re-established by inserting the response directly into the result
         // vector (e.g., results[10] = response).
         let mut results = vec![Value::Nil; cmds.len()];
 
-        let to_retry = self
-            .send_all_commands(cmds)
-            .and_then(|node_cmds| self.recv_all_commands(&mut results, &node_cmds))?;
+        let mut pending: Vec<PendingCmd> = (0..cmds.len()).map(PendingCmd::new).collect();
+        let mut retries = 0;
 
-        if to_retry.is_empty() {
-            return Ok(results);
+        loop {
+            let node_cmds = self.map_cmds_to_nodes(cmds, &pending)?;
+            let failed = self
+                .send_all_commands(&node_cmds)
+                .and_then(|()| self.recv_all_commands(&mut results, &node_cmds))?;
+
+            let Some((_, first_err)) = failed.first() else {
+                return Ok(results);
+            };
+
+            if retries == self.cluster_params.retry_params.number_of_retries {
+                // Out of attempts. Surface the first failure, the same way a
+                // single-command request reports the error it gave up on.
+                return Err(first_err.clone());
+            }
+            retries += 1;
+
+            pending = self.plan_pipeline_retry(failed, retries)?;
         }
-
-        // Refresh the slots to give the retry attempts a clean slate. Rate limited
-        // because it is an optimisation rather than the recovery mechanism: each
-        // command below is retried through `request`, which follows its own
-        // redirects and falls back to an unthrottled refresh when it cannot.
-        self.refresh_slots_rate_limited()?;
-
-        // Given that there are commands that need to be retried, it means something in the cluster
-        // topology changed. Execute each command separately to take advantage of the existing
-        // retry logic that handles these cases.
-        for retry_idx in to_retry {
-            let cmd = &cmds[retry_idx];
-            let routing = RoutingInfo::for_routable(cmd);
-            results[retry_idx] = self.request(Input::Cmd(cmd), routing)?.into();
-        }
-        Ok(results)
     }
 
-    // Build up a pipeline per node, then send it
-    fn send_all_commands(&self, cmds: &[Cmd]) -> RedisResult<Vec<NodeCmd>> {
+    /// Turn one attempt's failures into the next attempt's pending set, applying
+    /// the recovery that each error calls for.
+    ///
+    /// This mirrors the per-`RetryMethod` handling in [`Self::request_inner`], but
+    /// resolves a whole batch at once: the slot map is refreshed at most once and
+    /// a `WaitAndRetry` backoff is slept at most once per round, no matter how
+    /// many commands in the pipeline asked for it.
+    fn plan_pipeline_retry(
+        &self,
+        failed: Vec<(usize, RedisError)>,
+        retries: u32,
+    ) -> RedisResult<Vec<PendingCmd>> {
+        let mut pending = Vec::with_capacity(failed.len());
+        let mut refresh_now = false;
+        let mut refresh_rate_limited = false;
+        let mut sleep_time = Duration::ZERO;
+
+        for (idx, err) in failed {
+            match err.retry_method() {
+                RetryMethod::AskRedirect => {
+                    // Unlike MOVED, an ASK slot is still owned by the node that
+                    // issued the redirect, so the slot map must not be touched
+                    // here; the redirect applies to this one attempt only.
+                    let redirect = err
+                        .redirect_node()
+                        .and_then(|(node, _slot)| NodeAddress::try_from(node).ok())
+                        .map(Redirect::Ask);
+                    refresh_now |= redirect.is_none();
+                    pending.push(PendingCmd { idx, redirect });
+                }
+                RetryMethod::MovedRedirect => {
+                    let moved_to = err.redirect_node().and_then(|(node, slot)| {
+                        NodeAddress::try_from(node).ok().map(|addr| (addr, slot))
+                    });
+                    match moved_to {
+                        Some((addr, slot)) => {
+                            // A MOVED is authoritative about one slot's new owner,
+                            // so record it instead of discarding it and asking the
+                            // cluster to describe all 16384 slots again.
+                            self.slots.borrow_mut().update_slot(slot, addr.clone());
+                            refresh_rate_limited = true;
+                            pending.push(PendingCmd {
+                                idx,
+                                redirect: Some(Redirect::Moved(addr)),
+                            });
+                        }
+                        None => {
+                            // A redirect we cannot parse teaches us nothing and
+                            // leaves us no node to retry against, so the full
+                            // refresh is the only way to make progress.
+                            refresh_now = true;
+                            pending.push(PendingCmd::new(idx));
+                        }
+                    }
+                }
+                RetryMethod::WaitAndRetry => {
+                    let wait = self
+                        .cluster_params
+                        .retry_params
+                        .wait_time_for_retry(retries);
+                    sleep_time = sleep_time.max(wait);
+                    pending.push(PendingCmd::new(idx));
+                }
+                RetryMethod::NoRetry => return Err(err),
+                // `recv_all_commands` only hands us errors that ask to be retried,
+                // so nothing else should reach this point. Re-routing through the
+                // slot map is the safe reading if that ever stops being true.
+                _ => pending.push(PendingCmd::new(idx)),
+            }
+        }
+
+        if refresh_now {
+            // Never rate limit this one: it is the recovery mechanism, not an
+            // optimisation.
+            self.refresh_slots()?;
+        } else if refresh_rate_limited {
+            // Having learned the new mappings first-hand, the full refresh is only
+            // about replica and node-set freshness, so it is safe to rate limit.
+            self.refresh_slots_rate_limited()?;
+        }
+        if !sleep_time.is_zero() {
+            thread::sleep(sleep_time);
+        }
+
+        Ok(pending)
+    }
+
+    // Send each node its pipeline.
+    fn send_all_commands(&self, node_cmds: &[NodeCmd]) -> RedisResult<()> {
         let mut connections = self.connections.borrow_mut();
 
-        let node_cmds = self.map_cmds_to_nodes(cmds)?;
-        for nc in &node_cmds {
+        for nc in node_cmds {
             self.get_connection_by_addr(&mut connections, &nc.addr)?
                 .send_packed_command(&nc.pipe)?;
         }
-        Ok(node_cmds)
+        Ok(())
     }
 
-    // Receive from each node, keeping track of which commands need to be retried.
+    // Receive from each node, keeping the errors that ask to be retried alongside
+    // the command they belong to.
     fn recv_all_commands(
         &self,
         results: &mut [Value],
         node_cmds: &[NodeCmd],
-    ) -> RedisResult<Vec<usize>> {
+    ) -> RedisResult<Vec<(usize, RedisError)>> {
         let mut to_retry = Vec::new();
         let mut connections = self.connections.borrow_mut();
         let mut first_err = None;
 
         for nc in node_cmds {
-            for cmd_idx in &nc.indexes {
-                match self
+            for response in &nc.responses {
+                let received = self
                     .get_connection_by_addr(&mut connections, &nc.addr)?
-                    .recv_response()
-                {
+                    .recv_response();
+                let Some(cmd_idx) = *response else {
+                    // The reply to an `ASKING` we injected. It has to come off the
+                    // socket to keep the rest of the pipe aligned, but no command is
+                    // waiting for it, and a redirect here is reported again by the
+                    // command it precedes.
+                    if let Err(err) = received {
+                        if !err.is_cluster_error() {
+                            first_err = first_err.or(Some(err));
+                        }
+                    }
+                    continue;
+                };
+                match received {
                     // The RESP parser reports server errors as
                     // `Ok(Value::ServerError(_))` rather than `Err`.
                     // A pipelined sub-command that gets a redirect/retryable error
                     // needs to be processed in the Ok arm and retried
-                    Ok(item) if item.is_error_that_requires_action() => to_retry.push(*cmd_idx),
-                    Ok(item) => results[*cmd_idx] = item,
-                    Err(err) if err.is_cluster_error() => to_retry.push(*cmd_idx),
+                    Ok(Value::ServerError(err)) if err.requires_action() => {
+                        to_retry.push((cmd_idx, err.into()))
+                    }
+                    Ok(item) => results[cmd_idx] = item,
+                    Err(err) if err.is_cluster_error() => to_retry.push((cmd_idx, err)),
                     Err(err) => first_err = first_err.or(Some(err)),
                 }
             }
@@ -1682,6 +1802,7 @@ where
 }
 
 const MULTI: &[u8] = "*1\r\n$5\r\nMULTI\r\n".as_bytes();
+const ASKING: &[u8] = "*1\r\n$6\r\nASKING\r\n".as_bytes();
 impl<C: Connect + ConnectionLike + Send> ConnectionLike for ClusterConnection<C> {
     fn supports_pipelining(&self) -> bool {
         false
@@ -1770,10 +1891,32 @@ impl<C: Connect + ConnectionLike + Send> ConnectionLike for ClusterConnection<C>
     }
 }
 
+/// A command from a cluster pipeline that is still waiting for a response.
+#[derive(Debug)]
+struct PendingCmd {
+    /// Index into the caller's command list, and into the results vector.
+    idx: usize,
+    /// Where the previous attempt's error said to send this command. Overrides
+    /// the slot map, for this attempt only.
+    redirect: Option<Redirect>,
+}
+
+impl PendingCmd {
+    /// A command with no redirect to honour, routed through the slot map.
+    fn new(idx: usize) -> PendingCmd {
+        PendingCmd {
+            idx,
+            redirect: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct NodeCmd {
-    // The original command indexes
-    indexes: Vec<usize>,
+    // Where each response to `pipe` goes, in wire order: `Some(i)` is stored as
+    // the result of the caller's command `i`, `None` is drained and dropped (the
+    // reply to an `ASKING` this pipe injected).
+    responses: Vec<Option<usize>>,
     pipe: Vec<u8>,
     addr: NodeAddress,
 }
@@ -1781,7 +1924,7 @@ struct NodeCmd {
 impl NodeCmd {
     fn new(a: NodeAddress) -> NodeCmd {
         NodeCmd {
-            indexes: vec![],
+            responses: vec![],
             pipe: vec![],
             addr: a,
         }
