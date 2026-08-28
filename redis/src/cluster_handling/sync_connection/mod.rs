@@ -538,7 +538,8 @@ where
     /// Refreshes the whole slot map, unless one was refreshed recently.
     ///
     /// Only for callers that have another way to reach the right node — a MOVED
-    /// whose hint has already been recorded by [`SlotMap::update_slot`], or a
+    /// whose hint has already been recorded by [`SlotMap::update_slot`] or
+    /// [`SlotMap::update_slots`], or a
     /// retry that will follow its own redirect. For those, refetching all 16384
     /// mappings is not what makes the request correct; it only refreshes replica
     /// sets, picks up nodes joining or leaving, and compacts a map that
@@ -1667,6 +1668,8 @@ where
         let mut reconnect = HashSet::new();
         let mut reconnect_from_initial = HashSet::new();
         let mut terminal_error = None;
+        let mut moved_hints = HashMap::new();
+        let mut conflicting_moved_slots = HashSet::new();
 
         for failure in failed {
             let PipelineCmdFailure {
@@ -1696,9 +1699,24 @@ where
                     match moved_to {
                         Some((addr, slot)) => {
                             // A MOVED is authoritative about one slot's new owner,
-                            // so record it instead of discarding it and asking the
-                            // cluster to describe all 16384 slots again.
-                            self.slots.borrow_mut().update_slot(slot, addr.clone());
+                            // so collect it instead of discarding it and asking the
+                            // cluster to describe all 16384 slots again. Identical
+                            // hints are applied once after the whole response batch.
+                            if !conflicting_moved_slots.contains(&slot) {
+                                match moved_hints.get(&slot) {
+                                    Some(existing) if existing != &addr => {
+                                        moved_hints.remove(&slot);
+                                        conflicting_moved_slots.insert(slot);
+                                        // Two authoritative destinations in one
+                                        // response batch leave no safe map value.
+                                        refresh_now = true;
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        moved_hints.insert(slot, addr.clone());
+                                    }
+                                }
+                            }
                             refresh_rate_limited = true;
                             pending.push(PendingCmd {
                                 idx: failed_cmd.idx,
@@ -1737,6 +1755,7 @@ where
             }
         }
 
+        self.slots.borrow_mut().update_slots(moved_hints);
         self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
 
         if let Some(err) = terminal_error {

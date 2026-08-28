@@ -596,6 +596,59 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_conflicting_moved_hints_refresh_the_slot_map() {
+        let name = "test_cluster_pipeline_conflicting_moved_hints_refresh_the_slot_map";
+        let topology_reads = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let topology_reads = topology_reads.clone();
+            move |cmd: &[u8], port| {
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    topology_reads.fetch_add(1, Ordering::SeqCst);
+                }
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 if contains_slice(cmd, b"key1") => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6379 => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6381\r\n").as_bytes(),
+                    )),
+                    6380 => Err(Ok(redis_value!("one"))),
+                    6381 => Err(Ok(redis_value!("two"))),
+                    _ => panic!("Wrong node: {port}"),
+                }
+            }
+        });
+        let startup_topology_reads = topology_reads.load(Ordering::SeqCst);
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["one".to_string(), "two".to_string()]));
+        // Conflicting authoritative owners for one slot require one additional
+        // unthrottled refresh instead of choosing whichever hint was processed last.
+        assert_eq!(
+            topology_reads.load(Ordering::SeqCst),
+            startup_topology_reads + 1
+        );
+
+        let mut writes = take_pipeline_writes(name);
+        assert_eq!(writes.remove(0), (6379, 2));
+        writes.sort();
+        assert_eq!(writes, vec![(6380, 1), (6381, 1)]);
+    }
+
+    #[test]
     fn test_cluster_pipeline_retries_only_the_commands_that_failed() {
         // A pipeline that straddles two nodes and gets a redirect from one of them
         // re-sends only that node's commands.
