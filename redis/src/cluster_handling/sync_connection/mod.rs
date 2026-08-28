@@ -1163,9 +1163,10 @@ where
                 // it is written once per redirected command rather than once per
                 // pipe, and it adds a response that nothing is waiting for.
                 nc.pipe.extend_from_slice(ASKING);
-                nc.responses.push(None);
+                nc.responses.push(NodeResponse::Asking);
             }
-            nc.responses.push(Some(pending_cmd.idx));
+            nc.responses
+                .push(NodeResponse::Command(pending_cmd.clone()));
             cmd.write_packed_command(&mut nc.pipe);
         }
 
@@ -1629,18 +1630,17 @@ where
 
         loop {
             let node_cmds = self.map_cmds_to_nodes(cmds, &pending)?;
-            let failed = self
-                .send_all_commands(&node_cmds)
-                .and_then(|()| self.recv_all_commands(&mut results, &node_cmds))?;
+            let (sent, failed) = self.send_all_commands(&node_cmds);
+            let failed = self.recv_all_commands(&mut results, &node_cmds, &sent, failed);
 
-            let Some((_, first_err)) = failed.first() else {
+            let Some(first_failure) = failed.first() else {
                 return Ok(results);
             };
 
             if retries == self.cluster_params.retry_params.number_of_retries {
                 // Out of attempts. Surface the first failure, the same way a
                 // single-command request reports the error it gave up on.
-                return Err(first_err.clone());
+                return Err(first_failure.error.clone());
             }
             retries += 1;
 
@@ -1657,15 +1657,23 @@ where
     /// many commands in the pipeline asked for it.
     fn plan_pipeline_retry(
         &self,
-        failed: Vec<(usize, RedisError)>,
+        failed: Vec<PipelineCmdFailure>,
         retries: u32,
     ) -> RedisResult<Vec<PendingCmd>> {
         let mut pending = Vec::with_capacity(failed.len());
         let mut refresh_now = false;
         let mut refresh_rate_limited = false;
         let mut sleep_time = Duration::ZERO;
+        let mut reconnect = HashSet::new();
+        let mut reconnect_from_initial = HashSet::new();
+        let mut terminal_error = None;
 
-        for (idx, err) in failed {
+        for failure in failed {
+            let PipelineCmdFailure {
+                pending: failed_cmd,
+                addr,
+                error: err,
+            } = failure;
             match err.retry_method() {
                 RetryMethod::AskRedirect => {
                     // Unlike MOVED, an ASK slot is still owned by the node that
@@ -1676,7 +1684,10 @@ where
                         .and_then(|(node, _slot)| NodeAddress::try_from(node).ok())
                         .map(Redirect::Ask);
                     refresh_now |= redirect.is_none();
-                    pending.push(PendingCmd { idx, redirect });
+                    pending.push(PendingCmd {
+                        idx: failed_cmd.idx,
+                        redirect,
+                    });
                 }
                 RetryMethod::MovedRedirect => {
                     let moved_to = err.redirect_node().and_then(|(node, slot)| {
@@ -1690,7 +1701,7 @@ where
                             self.slots.borrow_mut().update_slot(slot, addr.clone());
                             refresh_rate_limited = true;
                             pending.push(PendingCmd {
-                                idx,
+                                idx: failed_cmd.idx,
                                 redirect: Some(Redirect::Moved(addr)),
                             });
                         }
@@ -1699,7 +1710,7 @@ where
                             // leaves us no node to retry against, so the full
                             // refresh is the only way to make progress.
                             refresh_now = true;
-                            pending.push(PendingCmd::new(idx));
+                            pending.push(PendingCmd::new(failed_cmd.idx));
                         }
                     }
                 }
@@ -1709,14 +1720,27 @@ where
                         .retry_params
                         .wait_time_for_retry(retries);
                     sleep_time = sleep_time.max(wait);
-                    pending.push(PendingCmd::new(idx));
+                    pending.push(failed_cmd);
                 }
-                RetryMethod::NoRetry => return Err(err),
-                // `recv_all_commands` only hands us errors that ask to be retried,
-                // so nothing else should reach this point. Re-routing through the
-                // slot map is the safe reading if that ever stops being true.
-                _ => pending.push(PendingCmd::new(idx)),
+                RetryMethod::Reconnect => {
+                    reconnect.insert(addr);
+                    pending.push(failed_cmd);
+                }
+                RetryMethod::ReconnectFromInitialConnections => {
+                    reconnect_from_initial.insert(addr);
+                    pending.push(failed_cmd);
+                }
+                RetryMethod::RetryImmediately => pending.push(failed_cmd),
+                RetryMethod::NoRetry => {
+                    terminal_error = terminal_error.or(Some(err));
+                }
             }
+        }
+
+        self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
+
+        if let Some(err) = terminal_error {
+            return Err(err);
         }
 
         if refresh_now {
@@ -1735,15 +1759,62 @@ where
         Ok(pending)
     }
 
-    // Send each node its pipeline.
-    fn send_all_commands(&self, node_cmds: &[NodeCmd]) -> RedisResult<()> {
-        let mut connections = self.connections.borrow_mut();
-
-        for nc in node_cmds {
-            self.get_connection_by_addr(&mut connections, &nc.addr)?
-                .send_packed_command(&nc.pipe)?;
+    /// Repair connections that failed during one pipeline attempt.
+    ///
+    /// Recovery is done once per node after every response from the attempt has
+    /// been drained. The next attempt can therefore stay scoped to its pending
+    /// commands instead of returning an I/O error to the caller and inviting a
+    /// replay of the entire original pipeline.
+    fn recover_pipeline_connections(
+        &self,
+        reconnect: &HashSet<NodeAddress>,
+        reconnect_from_initial: &HashSet<NodeAddress>,
+    ) {
+        if !*self.auto_reconnect.borrow()
+            || (reconnect.is_empty() && reconnect_from_initial.is_empty())
+        {
+            return;
         }
-        Ok(())
+
+        let mut connections = self.connections.borrow_mut();
+        for addr in reconnect {
+            connections.remove(addr);
+            if let Ok(mut conn) = self.connect(addr)
+                && conn.check_connection()
+            {
+                connections.insert(addr.clone(), conn);
+            }
+        }
+        for addr in reconnect_from_initial {
+            if reconnect.contains(addr) {
+                continue;
+            }
+            if let Ok(mut conn) = self.connect(addr)
+                && conn.check_connection()
+            {
+                connections.insert(addr.clone(), conn);
+            }
+        }
+        self.notify_connections_changed(&connections);
+    }
+
+    // Send each node its pipeline, retaining failures for only that node's
+    // pending commands while allowing the other node pipelines to proceed.
+    fn send_all_commands(&self, node_cmds: &[NodeCmd]) -> (Vec<bool>, Vec<PipelineCmdFailure>) {
+        let mut connections = self.connections.borrow_mut();
+        let mut sent = vec![false; node_cmds.len()];
+        let mut failed = Vec::new();
+
+        for (node_idx, nc) in node_cmds.iter().enumerate() {
+            match self
+                .get_connection_by_addr(&mut connections, &nc.addr)
+                .and_then(|conn| conn.send_packed_command(&nc.pipe))
+            {
+                Ok(()) => sent[node_idx] = true,
+                Err(err) => failed.extend(nc.failures_from(err)),
+            }
+        }
+        (sent, failed)
     }
 
     // Receive from each node, keeping the errors that ask to be retried alongside
@@ -1752,26 +1823,40 @@ where
         &self,
         results: &mut [Value],
         node_cmds: &[NodeCmd],
-    ) -> RedisResult<Vec<(usize, RedisError)>> {
-        let mut to_retry = Vec::new();
+        sent: &[bool],
+        mut failed: Vec<PipelineCmdFailure>,
+    ) -> Vec<PipelineCmdFailure> {
         let mut connections = self.connections.borrow_mut();
-        let mut first_err = None;
 
-        for nc in node_cmds {
-            for response in &nc.responses {
-                let received = self
-                    .get_connection_by_addr(&mut connections, &nc.addr)?
-                    .recv_response();
-                let Some(cmd_idx) = *response else {
+        for (node_idx, nc) in node_cmds.iter().enumerate() {
+            if !sent[node_idx] {
+                continue;
+            }
+            let conn = match self.get_connection_by_addr(&mut connections, &nc.addr) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    failed.extend(nc.failures_from(err));
+                    continue;
+                }
+            };
+
+            for (response_idx, response) in nc.responses.iter().enumerate() {
+                let received = conn.recv_response();
+                if let Err(err) = &received
+                    && !err.is_cluster_error()
+                {
+                    // This connection can no longer provide a trustworthy framed
+                    // response. Everything at and behind this position remains
+                    // unresolved and is retried on a repaired connection.
+                    failed.extend(nc.failures_from_response(response_idx, err.clone()));
+                    break;
+                }
+
+                let NodeResponse::Command(pending_cmd) = response else {
                     // The reply to an `ASKING` we injected. It has to come off the
                     // socket to keep the rest of the pipe aligned, but no command is
                     // waiting for it, and a redirect here is reported again by the
                     // command it precedes.
-                    if let Err(err) = received {
-                        if !err.is_cluster_error() {
-                            first_err = first_err.or(Some(err));
-                        }
-                    }
                     continue;
                 };
                 match received {
@@ -1780,18 +1865,22 @@ where
                     // A pipelined sub-command that gets a redirect/retryable error
                     // needs to be processed in the Ok arm and retried
                     Ok(Value::ServerError(err)) if err.requires_action() => {
-                        to_retry.push((cmd_idx, err.into()))
+                        failed.push(PipelineCmdFailure::new(
+                            pending_cmd.clone(),
+                            nc.addr.clone(),
+                            err.into(),
+                        ));
                     }
-                    Ok(item) => results[cmd_idx] = item,
-                    Err(err) if err.is_cluster_error() => to_retry.push((cmd_idx, err)),
-                    Err(err) => first_err = first_err.or(Some(err)),
+                    Ok(item) => results[pending_cmd.idx] = item,
+                    Err(err) => failed.push(PipelineCmdFailure::new(
+                        pending_cmd.clone(),
+                        nc.addr.clone(),
+                        err,
+                    )),
                 }
             }
         }
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(to_retry),
-        }
+        failed
     }
 
     /// Send a command to the given `routing`.
@@ -1892,7 +1981,7 @@ impl<C: Connect + ConnectionLike + Send> ConnectionLike for ClusterConnection<C>
 }
 
 /// A command from a cluster pipeline that is still waiting for a response.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PendingCmd {
     /// Index into the caller's command list, and into the results vector.
     idx: usize,
@@ -1912,11 +2001,34 @@ impl PendingCmd {
 }
 
 #[derive(Debug)]
+enum NodeResponse {
+    Asking,
+    Command(PendingCmd),
+}
+
+#[derive(Debug)]
+struct PipelineCmdFailure {
+    pending: PendingCmd,
+    addr: NodeAddress,
+    error: RedisError,
+}
+
+impl PipelineCmdFailure {
+    fn new(pending: PendingCmd, addr: NodeAddress, error: RedisError) -> Self {
+        Self {
+            pending,
+            addr,
+            error,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct NodeCmd {
-    // Where each response to `pipe` goes, in wire order: `Some(i)` is stored as
-    // the result of the caller's command `i`, `None` is drained and dropped (the
-    // reply to an `ASKING` this pipe injected).
-    responses: Vec<Option<usize>>,
+    // Where each response to `pipe` goes, in wire order. A command retains its
+    // pending routing so a transport failure can retry the unresolved suffix on
+    // the same redirect target.
+    responses: Vec<NodeResponse>,
     pipe: Vec<u8>,
     addr: NodeAddress,
 }
@@ -1928,6 +2040,28 @@ impl NodeCmd {
             pipe: vec![],
             addr: a,
         }
+    }
+
+    fn failures_from(&self, error: RedisError) -> Vec<PipelineCmdFailure> {
+        self.failures_from_response(0, error)
+    }
+
+    fn failures_from_response(
+        &self,
+        response_idx: usize,
+        error: RedisError,
+    ) -> Vec<PipelineCmdFailure> {
+        self.responses[response_idx..]
+            .iter()
+            .filter_map(|response| match response {
+                NodeResponse::Asking => None,
+                NodeResponse::Command(pending) => Some(PipelineCmdFailure::new(
+                    pending.clone(),
+                    self.addr.clone(),
+                    error.clone(),
+                )),
+            })
+            .collect()
     }
 }
 

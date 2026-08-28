@@ -638,6 +638,117 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_recovers_retry_send_failure_for_pending_commands() {
+        let name = "test_cluster_pipeline_recovers_retry_send_failure_for_pending_commands";
+        set_pipeline_send_results(
+            name,
+            vec![
+                Ok(()),
+                Err(RedisError::from(std::io::Error::from(
+                    std::io::ErrorKind::BrokenPipe,
+                ))),
+                Ok(()),
+            ],
+        );
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], port| {
+            respond_startup(name, cmd)?;
+
+            match port {
+                6379 => Err(parse_redis_value(
+                    format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                )),
+                6380 if contains_slice(cmd, b"key1") => Err(Ok(redis_value!("one"))),
+                6380 if contains_slice(cmd, b"key2") => Err(Ok(redis_value!("two"))),
+                _ => panic!("Wrong node or command: port={port}, cmd={cmd:?}"),
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["one".to_string(), "two".to_string()]));
+        // The failed write is retried internally with the same pending subset.
+        // Returning its I/O error would make redis-lightning replay the original
+        // pipeline instead.
+        assert_eq!(
+            take_pipeline_writes(name),
+            vec![(6379, 2), (6380, 2), (6380, 2)]
+        );
+    }
+
+    #[test]
+    fn test_cluster_pipeline_recovers_retry_receive_failure_for_unresolved_commands() {
+        let name = "test_cluster_pipeline_recovers_retry_receive_failure_for_unresolved_commands";
+        let key2_responses = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let key2_responses = key2_responses.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 if contains_slice(cmd, b"stable") => Err(Ok(redis_value!("stable"))),
+                    6379 => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6380 if contains_slice(cmd, b"key1") => Err(Ok(redis_value!("one"))),
+                    6380 if contains_slice(cmd, b"key2") => {
+                        if key2_responses.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(Err(RedisError::from(std::io::Error::from(
+                                std::io::ErrorKind::ConnectionReset,
+                            ))))
+                        } else {
+                            Err(Ok(redis_value!("two")))
+                        }
+                    }
+                    6380 if contains_slice(cmd, b"key3") => Err(Ok(redis_value!("three"))),
+                    _ => panic!("Wrong node or command: port={port}, cmd={cmd:?}"),
+                }
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}stable")
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .cmd("GET")
+            .arg("{x}key3")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(
+            value,
+            Ok(vec![
+                "stable".to_string(),
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+            ])
+        );
+        // The stable command and key1 already have responses. Only the command
+        // whose response failed and the unread command behind it are replayed.
+        assert_eq!(
+            take_pipeline_writes(name),
+            vec![(6379, 4), (6380, 3), (6380, 2)]
+        );
+    }
+
+    #[test]
     fn test_cluster_pipeline_ask_redirect_asks_inside_the_retry_pipeline() {
         // `ASKING` only covers the command that immediately follows it, so a
         // retried pipeline has to carry one per redirected command rather than one

@@ -32,6 +32,11 @@ type PipelineWrite = (u16, usize);
 static PIPELINE_WRITES: LazyLock<RwLock<HashMap<String, Vec<PipelineWrite>>>> =
     LazyLock::new(Default::default);
 
+/// Scripted results for successive packed pipeline writes, per mock cluster.
+/// Missing entries and exhausted scripts mean success.
+static PIPELINE_SEND_RESULTS: LazyLock<RwLock<HashMap<String, VecDeque<RedisResult<()>>>>> =
+    LazyLock::new(Default::default);
+
 /// Take the packed pipeline writes recorded for `name` since the last call, in
 /// the order they were written, as `(port, commands in that write)`.
 ///
@@ -45,6 +50,14 @@ pub fn take_pipeline_writes(name: &str) -> Vec<PipelineWrite> {
         .unwrap()
         .remove(name)
         .unwrap_or_default()
+}
+
+/// Set the results returned by successive `send_packed_command` calls.
+pub fn set_pipeline_send_results(name: &str, results: Vec<RedisResult<()>>) {
+    PIPELINE_SEND_RESULTS
+        .write()
+        .unwrap()
+        .insert(name.to_string(), results.into());
 }
 
 #[derive(Clone)]
@@ -121,8 +134,16 @@ impl cluster::Connect for MockConnection {
             .entry(self.name.clone())
             .or_default()
             .push((self.port, commands.len()));
-        self.pending.extend(commands);
-        Ok(())
+        let result = PIPELINE_SEND_RESULTS
+            .write()
+            .unwrap()
+            .get_mut(&self.name)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(Ok(()));
+        if result.is_ok() {
+            self.pending.extend(commands);
+        }
+        result
     }
 
     fn set_write_timeout(&self, _dur: Option<std::time::Duration>) -> RedisResult<()> {
