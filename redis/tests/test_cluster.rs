@@ -816,6 +816,58 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_returns_asking_error_after_draining_guarded_response() {
+        let name = "test_cluster_pipeline_returns_asking_error_after_draining_guarded_response";
+        let guarded_responses = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")]).retries(1),
+            name,
+            {
+                let guarded_responses = guarded_responses.clone();
+                move |cmd: &[u8], port| {
+                    respond_startup(name, cmd)?;
+
+                    match port {
+                        6379 => Err(parse_redis_value(
+                            format!("-ASK {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                        )),
+                        6380 if contains_slice(cmd, b"ASKING") => {
+                            Err(parse_redis_value(b"-NOPERM ASKING is forbidden\r\n"))
+                        }
+                        6380 => {
+                            guarded_responses.fetch_add(1, Ordering::SeqCst);
+                            // This is the response behind the failed ASKING. It
+                            // still has to be consumed to preserve framing, but
+                            // must not replace the more informative NOPERM.
+                            Err(parse_redis_value(
+                                format!("-ASK {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                            ))
+                        }
+                        _ => panic!("Wrong node: {port}"),
+                    }
+                }
+            },
+        );
+
+        let result = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+
+        assert!(
+            matches!(&result, Err(err) if err.kind() == ServerErrorKind::NoPerm.into()),
+            "{result:?}",
+        );
+        assert_eq!(guarded_responses.load(Ordering::SeqCst), 1);
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 1), (6380, 2)]);
+    }
+
+    #[test]
     fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
         // A redirect the client can never satisfy is retried as a pipeline the
         // configured number of times, then reported.

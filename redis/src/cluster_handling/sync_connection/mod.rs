@@ -1839,12 +1839,22 @@ where
                     continue;
                 }
             };
+            let mut asking_error = None;
 
             for (response_idx, response) in nc.responses.iter().enumerate() {
                 let received = conn.recv_response();
                 if let Err(err) = &received
                     && !err.is_cluster_error()
                 {
+                    if let NodeResponse::Command(pending_cmd) = response
+                        && let Some(err) = asking_error.take()
+                    {
+                        failed.push(PipelineCmdFailure::new(
+                            pending_cmd.clone(),
+                            nc.addr.clone(),
+                            err,
+                        ));
+                    }
                     // This connection can no longer provide a trustworthy framed
                     // response. Everything at and behind this position remains
                     // unresolved and is retried on a repaired connection.
@@ -1852,13 +1862,31 @@ where
                     break;
                 }
 
-                let NodeResponse::Command(pending_cmd) = response else {
-                    // The reply to an `ASKING` we injected. It has to come off the
-                    // socket to keep the rest of the pipe aligned, but no command is
-                    // waiting for it, and a redirect here is reported again by the
-                    // command it precedes.
-                    continue;
+                let pending_cmd = match response {
+                    NodeResponse::Asking => {
+                        debug_assert!(asking_error.is_none());
+                        // Server errors are represented as successful Value reads,
+                        // so extract them before draining the guarded command. The
+                        // error is assigned to that command on the next iteration.
+                        asking_error = received.and_then(Value::extract_error).err();
+                        continue;
+                    }
+                    NodeResponse::Command(pending_cmd) => pending_cmd,
                 };
+
+                if let Some(err) = asking_error.take() {
+                    // ASKING and the guarded command were already written together.
+                    // The latter response is now drained, but the preamble failure
+                    // determines the command's result just as it does on the
+                    // single-command redirect path.
+                    failed.push(PipelineCmdFailure::new(
+                        pending_cmd.clone(),
+                        nc.addr.clone(),
+                        err,
+                    ));
+                    continue;
+                }
+
                 match received {
                     // The RESP parser reports server errors as
                     // `Ok(Value::ServerError(_))` rather than `Err`.
@@ -1879,6 +1907,7 @@ where
                     )),
                 }
             }
+            debug_assert!(asking_error.is_none());
         }
         failed
     }
