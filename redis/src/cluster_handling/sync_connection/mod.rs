@@ -1756,7 +1756,21 @@ where
         }
 
         self.slots.borrow_mut().update_slots(moved_hints);
-        self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
+        let unrepaired = self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
+        if !unrepaired.is_empty() {
+            // A redirect pinned to a node we cannot reach would stick for the
+            // whole retry budget, overriding whatever the slot map learns in the
+            // meantime. Unpin those commands so the map routes them, and ask for
+            // a refresh so it has a chance to know better.
+            for cmd in &mut pending {
+                if let Some(Redirect::Moved(addr) | Redirect::Ask(addr)) = &cmd.redirect
+                    && unrepaired.contains(addr)
+                {
+                    cmd.redirect = None;
+                }
+            }
+            refresh_rate_limited = true;
+        }
 
         if let Some(err) = terminal_error {
             return Err(err);
@@ -1784,17 +1798,24 @@ where
     /// been drained. The next attempt can therefore stay scoped to its pending
     /// commands instead of returning an I/O error to the caller and inviting a
     /// replay of the entire original pipeline.
+    ///
+    /// Returns the addresses that were asked for and remain without a live
+    /// connection, so the caller can stop routing to them.
     fn recover_pipeline_connections(
         &self,
         reconnect: &HashSet<NodeAddress>,
         reconnect_from_initial: &HashSet<NodeAddress>,
-    ) {
-        if !*self.auto_reconnect.borrow()
-            || (reconnect.is_empty() && reconnect_from_initial.is_empty())
-        {
-            return;
+    ) -> HashSet<NodeAddress> {
+        if reconnect.is_empty() && reconnect_from_initial.is_empty() {
+            return HashSet::new();
+        }
+        if !*self.auto_reconnect.borrow() {
+            // Nothing gets repaired; report everything unrepaired so the caller
+            // routes around these nodes instead of re-sending into them.
+            return reconnect.union(reconnect_from_initial).cloned().collect();
         }
 
+        let mut unrepaired = HashSet::new();
         let mut connections = self.connections.borrow_mut();
         for addr in reconnect {
             connections.remove(addr);
@@ -1802,6 +1823,8 @@ where
                 && conn.check_connection()
             {
                 connections.insert(addr.clone(), conn);
+            } else {
+                unrepaired.insert(addr.clone());
             }
         }
         for addr in reconnect_from_initial {
@@ -1812,9 +1835,12 @@ where
                 && conn.check_connection()
             {
                 connections.insert(addr.clone(), conn);
+            } else {
+                unrepaired.insert(addr.clone());
             }
         }
         self.notify_connections_changed(&connections);
+        unrepaired
     }
 
     // Send each node its pipeline, retaining failures for only that node's

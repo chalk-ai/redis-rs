@@ -1036,6 +1036,57 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_unpins_a_redirect_whose_target_cannot_connect() {
+        // A MOVED can name a node the client cannot reach (e.g. one that left the
+        // cluster mid-reshard). Once reconnecting to it fails, the pin must not
+        // stick for the whole retry budget; the command falls back to the slot
+        // map, which the refresh has meanwhile corrected.
+        let name = "test_cluster_pipeline_unpins_a_redirect_whose_target_cannot_connect";
+        set_connect_errors(name, [6380]);
+        let key1_reads = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(3)
+                .min_slot_refresh_interval(std::time::Duration::ZERO),
+            name,
+            {
+                let key1_reads = key1_reads.clone();
+                move |cmd: &[u8], port| {
+                    respond_startup(name, cmd)?;
+
+                    match port {
+                        6379 => {
+                            if key1_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                                Err(parse_redis_value(
+                                    format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                                ))
+                            } else {
+                                Err(Ok(redis_value!("one")))
+                            }
+                        }
+                        _ => panic!("Wrong node: {port}"),
+                    }
+                }
+            },
+        );
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["one".to_string()]));
+        // The round pinned to 6380 never gets as far as a write (connect fails);
+        // the round after routes through the slot map back to 6379.
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 1), (6379, 1)]);
+    }
+
+    #[test]
     fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
         // A redirect the client can never satisfy is retried as a pipeline the
         // configured number of times, then reported.

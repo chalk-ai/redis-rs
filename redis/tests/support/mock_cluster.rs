@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, LazyLock, RwLock},
     time::Duration,
 };
@@ -60,6 +60,19 @@ pub fn set_pipeline_send_results(name: &str, results: Vec<RedisResult<()>>) {
         .insert(name.to_string(), results.into());
 }
 
+/// Ports whose sync `connect` fails with `ConnectionRefused`, per mock cluster.
+static CONNECT_ERRORS: LazyLock<RwLock<HashMap<String, HashSet<u16>>>> =
+    LazyLock::new(Default::default);
+
+/// Make the sync `connect` fail for these ports of the named mock cluster.
+#[allow(dead_code)]
+pub fn set_connect_errors(name: &str, ports: impl IntoIterator<Item = u16>) {
+    CONNECT_ERRORS
+        .write()
+        .unwrap()
+        .insert(name.to_string(), ports.into_iter().collect());
+}
+
 #[derive(Clone)]
 pub struct MockConnection {
     pub handler: Handler,
@@ -113,6 +126,16 @@ impl cluster::Connect for MockConnection {
             redis::ConnectionAddr::Tcp(addr, port) => (addr, *port),
             _ => unreachable!(),
         };
+        if CONNECT_ERRORS
+            .read()
+            .unwrap()
+            .get(name.as_str())
+            .is_some_and(|ports| ports.contains(&port))
+        {
+            return Err(redis::RedisError::from(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )));
+        }
         Ok(MockConnection {
             handler: HANDLERS
                 .read()
