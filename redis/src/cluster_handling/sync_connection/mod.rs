@@ -1648,19 +1648,50 @@ where
             let (sent, failed) = self.send_all_commands(&node_cmds);
             let failed = self.recv_all_commands(&mut results, &node_cmds, &sent, failed);
 
-            let Some(first_failure) = failed.first() else {
+            if failed.is_empty() {
                 return Ok(results);
-            };
+            }
 
             if retries == self.cluster_params.retry_params.number_of_retries {
-                // Out of attempts. Surface the first failure, the same way a
-                // single-command request reports the error it gave up on.
-                return Err(first_failure.error.clone());
+                return Err(self.give_up_pipeline(failed));
             }
             retries += 1;
 
             pending = self.plan_pipeline_retry(failed, retries)?;
         }
+    }
+
+    /// Out of attempts: record what the final round still taught us, then pick
+    /// the error to surface.
+    ///
+    /// The final round's MOVED hints are kept so later requests do not have to
+    /// rediscover them (a conflicting pair may record one stale hint; the next
+    /// MOVED corrects it at the cost of one redirect). The surfaced error is
+    /// deterministic — a terminal failure if there is one, else the earliest
+    /// command's — rather than whichever node happened to iterate first out of
+    /// a HashMap, where a retryable MOVED could mask a NoRetry error.
+    fn give_up_pipeline(&self, failed: Vec<PipelineCmdFailure>) -> RedisError {
+        let moved_hints: HashMap<u16, NodeAddress> = failed
+            .iter()
+            .filter(|failure| matches!(failure.error.retry_method(), RetryMethod::MovedRedirect))
+            .filter_map(|failure| {
+                failure.error.redirect_node().and_then(|(node, slot)| {
+                    NodeAddress::try_from(node).ok().map(|addr| (slot, addr))
+                })
+            })
+            .collect();
+        self.slots.borrow_mut().update_slots(moved_hints);
+
+        failed
+            .into_iter()
+            .min_by_key(|failure| {
+                (
+                    !matches!(failure.error.retry_method(), RetryMethod::NoRetry),
+                    failure.pending.idx,
+                )
+            })
+            .expect("the retry loop only gives up on a non-empty failure set")
+            .error
     }
 
     /// Turn one attempt's failures into the next attempt's pending set, applying
