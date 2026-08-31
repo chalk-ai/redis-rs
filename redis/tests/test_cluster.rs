@@ -802,6 +802,63 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_drops_the_connection_when_a_receive_times_out() {
+        // A read timeout is retried on the spot (`RetryImmediately`), but the
+        // abandoned pipe's unread responses are still buffered on the old
+        // socket. Reusing it would answer the retried commands with the previous
+        // attempt's leftovers, shifting every response one command over.
+        let name = "test_cluster_pipeline_drops_the_connection_when_a_receive_times_out";
+        let key2_responses = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let key2_responses = key2_responses.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 if contains_slice(cmd, b"key1") => Err(Ok(redis_value!("one"))),
+                    6379 if contains_slice(cmd, b"key2") => {
+                        if key2_responses.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(Err(RedisError::from(std::io::Error::from(
+                                std::io::ErrorKind::TimedOut,
+                            ))))
+                        } else {
+                            Err(Ok(redis_value!("two")))
+                        }
+                    }
+                    6379 if contains_slice(cmd, b"key3") => Err(Ok(redis_value!("three"))),
+                    _ => panic!("Wrong node or command: port={port}, cmd={cmd:?}"),
+                }
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .cmd("GET")
+            .arg("{x}key3")
+            .query::<Vec<String>>(&mut connection);
+
+        // On a reused socket the retry would read the buffered answer to key3 as
+        // the answer to key2, and key2's fresh answer as key3's.
+        assert_eq!(
+            value,
+            Ok(vec![
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+            ])
+        );
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 3), (6379, 2)]);
+    }
+
+    #[test]
     fn test_cluster_pipeline_ask_redirect_asks_inside_the_retry_pipeline() {
         // `ASKING` only covers the command that immediately follows it, so a
         // retried pipeline has to carry one per redirected command rather than one

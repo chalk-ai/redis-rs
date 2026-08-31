@@ -1824,14 +1824,26 @@ where
         let mut sent = vec![false; node_cmds.len()];
         let mut failed = Vec::new();
 
+        let mut dropped_any = false;
         for (node_idx, nc) in node_cmds.iter().enumerate() {
             match self
                 .get_connection_by_addr(&mut connections, &nc.addr)
                 .and_then(|conn| conn.send_packed_command(&nc.pipe))
             {
                 Ok(()) => sent[node_idx] = true,
-                Err(err) => failed.extend(nc.failures_from(err)),
+                Err(err) => {
+                    // A failed write may have flushed part of the pipe, and the
+                    // node will answer whatever prefix it received. Reusing the
+                    // connection would hand those responses to the next attempt's
+                    // commands, so the socket must not go back into the pool,
+                    // whatever the error's retry classification says.
+                    dropped_any |= connections.remove(&nc.addr).is_some();
+                    failed.extend(nc.failures_from(err));
+                }
             }
+        }
+        if dropped_any {
+            self.notify_connections_changed(&connections);
         }
         (sent, failed)
     }
@@ -1846,6 +1858,7 @@ where
         mut failed: Vec<PipelineCmdFailure>,
     ) -> Vec<PipelineCmdFailure> {
         let mut connections = self.connections.borrow_mut();
+        let mut dropped_any = false;
 
         for (node_idx, nc) in node_cmds.iter().enumerate() {
             if !sent[node_idx] {
@@ -1859,6 +1872,7 @@ where
                 }
             };
             let mut asking_error = None;
+            let mut drain_broke = false;
 
             for (response_idx, response) in nc.responses.iter().enumerate() {
                 let received = conn.recv_response();
@@ -1878,6 +1892,7 @@ where
                     // response. Everything at and behind this position remains
                     // unresolved and is retried on a repaired connection.
                     failed.extend(nc.failures_from_response(response_idx, err.clone()));
+                    drain_broke = true;
                     break;
                 }
 
@@ -1927,6 +1942,18 @@ where
                 }
             }
             debug_assert!(asking_error.is_none());
+            if drain_broke {
+                // The abandoned suffix's responses are still buffered on the
+                // socket. `messages_to_skip` realigns after exactly one failed
+                // read, not a whole suffix, so a reused connection would answer
+                // the next attempt's commands with this attempt's leftovers —
+                // even for errors whose retry method keeps the node (e.g. a read
+                // timeout). Drop the connection; the retry reconnects lazily.
+                dropped_any |= connections.remove(&nc.addr).is_some();
+            }
+        }
+        if dropped_any {
+            self.notify_connections_changed(&connections);
         }
         failed
     }
