@@ -978,6 +978,64 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_does_not_double_enqueue_an_ask_guarded_command() {
+        // A retryable ASKING error followed by a transport failure on the guarded
+        // read used to enqueue the same command twice — once for the ASKING error
+        // and once in the broken drain's suffix — so the next round executed it
+        // twice. Non-idempotent commands must run exactly once per round.
+        let name = "test_cluster_pipeline_does_not_double_enqueue_an_ask_guarded_command";
+        let asking_calls = Arc::new(atomic::AtomicUsize::new(0));
+        let guarded_calls = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let asking_calls = asking_calls.clone();
+            let guarded_calls = guarded_calls.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 => Err(parse_redis_value(
+                        format!("-ASK {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6380 if contains_slice(cmd, b"ASKING") => {
+                        if asking_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(parse_redis_value(b"-TRYAGAIN try again later\r\n"))
+                        } else {
+                            Err(Ok(Value::SimpleString("OK".into())))
+                        }
+                    }
+                    6380 => {
+                        if guarded_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(Err(RedisError::from(std::io::Error::from(
+                                std::io::ErrorKind::ConnectionReset,
+                            ))))
+                        } else {
+                            Err(Ok(redis_value!("one")))
+                        }
+                    }
+                    _ => panic!("Wrong node: {port}"),
+                }
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["one".to_string()]));
+        // The third write must carry one ASKING + one command, not two of each.
+        assert_eq!(
+            take_pipeline_writes(name),
+            vec![(6379, 1), (6380, 2), (6380, 2)]
+        );
+    }
+
+    #[test]
     fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
         // A redirect the client can never satisfy is retried as a pipeline the
         // configured number of times, then reported.

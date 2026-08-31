@@ -1879,6 +1879,7 @@ where
                 if let Err(err) = &received
                     && !err.is_cluster_error()
                 {
+                    let mut suffix_start = response_idx;
                     if let NodeResponse::Command(pending_cmd) = response
                         && let Some(err) = asking_error.take()
                     {
@@ -1887,11 +1888,15 @@ where
                             nc.addr.clone(),
                             err,
                         ));
+                        // The ASKING failure above already enqueued this command;
+                        // including it in the suffix as well would run it twice
+                        // next round.
+                        suffix_start = response_idx + 1;
                     }
                     // This connection can no longer provide a trustworthy framed
                     // response. Everything at and behind this position remains
                     // unresolved and is retried on a repaired connection.
-                    failed.extend(nc.failures_from_response(response_idx, err.clone()));
+                    failed.extend(nc.failures_from_response(suffix_start, err.clone()));
                     drain_broke = true;
                     break;
                 }
