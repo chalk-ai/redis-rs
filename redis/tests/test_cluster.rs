@@ -1087,6 +1087,49 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_routes_an_uncovered_slot_to_a_random_node() {
+        // A refresh that races a reshard can return a slot map with a gap. A
+        // command in the gap must bounce off some node and follow the MOVED it
+        // gets back — like the single-command path — rather than failing the
+        // whole pipeline with "Missing slot coverage".
+        let name = "test_cluster_pipeline_routes_an_uncovered_slot_to_a_random_node";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], port| {
+            // The advertised topology covers only slots 0..8191; {x} hashes to
+            // slot 16287, which no node claims.
+            respond_startup_with_replica_using_config(
+                name,
+                cmd,
+                Some(vec![MockSlotRange {
+                    primary_port: 6379,
+                    replica_ports: vec![],
+                    slot_range: (0..8191),
+                }]),
+            )?;
+
+            match port {
+                6379 => Err(parse_redis_value(
+                    format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                )),
+                6380 => Err(Ok(redis_value!("one"))),
+                _ => panic!("Wrong node: {port}"),
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["one".to_string()]));
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 1), (6380, 1)]);
+    }
+
+    #[test]
     fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
         // A redirect the client can never satisfy is retried as a pipeline the
         // configured number of times, then reported.

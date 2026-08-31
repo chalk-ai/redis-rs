@@ -1122,22 +1122,36 @@ where
     fn get_addr_for_cmd(&self, cmd: &Cmd) -> RedisResult<NodeAddress> {
         let slots = self.slots.borrow();
 
-        let addr_for_slot = |route: Route| -> RedisResult<NodeAddress> {
-            let slot_addr = slots
+        let addr_for_slot = |route: Route| -> Option<NodeAddress> {
+            slots
                 .slot_addr_for_route(&route, self.routing_strategy.as_deref())
-                .ok_or((ErrorKind::Client, "Missing slot coverage"))?;
-            Ok(slot_addr.clone())
+                .cloned()
         };
 
-        match RoutingInfo::for_routable(cmd) {
-            Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)) => Ok(addr_for_slot(
-                Route::with_slot(Slot::new_random(), SlotAddr::Master),
-            )?),
+        let addr = match RoutingInfo::for_routable(cmd) {
+            Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)) => {
+                addr_for_slot(Route::with_slot(Slot::new_random(), SlotAddr::Master))
+            }
             Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(route))) => {
-                Ok(addr_for_slot(route)?)
+                addr_for_slot(route)
             }
             _ => fail!(UNROUTABLE_ERROR),
+        };
+        if let Some(addr) = addr {
+            return Ok(addr);
         }
+        // The slot map has a gap (e.g. a refresh raced a reshard). Try a random
+        // connected node, the same fallback the single-command path uses: slots
+        // are involved, so a wrong node rejects the command with a MOVED that
+        // teaches the next round the real owner.
+        self.connections
+            .borrow()
+            .keys()
+            .choose(&mut rng())
+            .cloned()
+            .ok_or_else(|| {
+                RedisError::from((ErrorKind::ClusterConnectionNotFound, "No connections found"))
+            })
     }
 
     /// Group the `pending` commands into one pipeline per node.
