@@ -1806,7 +1806,9 @@ where
             // A redirect pinned to a node we cannot reach would stick for the
             // whole retry budget, overriding whatever the slot map learns in the
             // meantime. Unpin those commands so the map routes them, and ask for
-            // a refresh so it has a chance to know better.
+            // an immediate refresh so it has a chance to know better. Unlike a
+            // usable MOVED redirect, unpinning has no recovery path while the
+            // slot map still names the unreachable node.
             for cmd in &mut pending {
                 if let Some(Redirect::Moved(addr) | Redirect::Ask(addr)) = &cmd.redirect
                     && unrepaired.contains(addr)
@@ -1814,7 +1816,7 @@ where
                     cmd.redirect = None;
                 }
             }
-            refresh_rate_limited = true;
+            refresh_now = true;
         }
 
         if let Some(err) = terminal_error {

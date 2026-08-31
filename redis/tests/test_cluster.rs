@@ -1044,6 +1044,7 @@ mod cluster {
         let name = "test_cluster_pipeline_unpins_a_redirect_whose_target_cannot_connect";
         set_connect_errors(name, [6380]);
         let key1_reads = Arc::new(atomic::AtomicUsize::new(0));
+        let topology_reads = Arc::new(atomic::AtomicUsize::new(0));
 
         let MockEnv {
             mut connection,
@@ -1052,11 +1053,16 @@ mod cluster {
         } = MockEnv::with_client_builder(
             ClusterClient::builder(vec![&*format!("redis://{name}")])
                 .retries(3)
-                .min_slot_refresh_interval(std::time::Duration::ZERO),
+                // The connection failure must bypass the MOVED refresh limiter.
+                .min_slot_refresh_interval(std::time::Duration::from_secs(3600)),
             name,
             {
                 let key1_reads = key1_reads.clone();
+                let topology_reads = topology_reads.clone();
                 move |cmd: &[u8], port| {
+                    if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                        topology_reads.fetch_add(1, Ordering::SeqCst);
+                    }
                     respond_startup(name, cmd)?;
 
                     match port {
@@ -1074,6 +1080,7 @@ mod cluster {
                 }
             },
         );
+        let startup_topology_reads = topology_reads.load(Ordering::SeqCst);
 
         let value = cluster_pipe()
             .cmd("GET")
@@ -1081,6 +1088,10 @@ mod cluster {
             .query::<Vec<String>>(&mut connection);
 
         assert_eq!(value, Ok(vec!["one".to_string()]));
+        assert_eq!(
+            topology_reads.load(Ordering::SeqCst),
+            startup_topology_reads + 1
+        );
         // The round pinned to 6380 never gets as far as a write (connect fails);
         // the round after routes through the slot map back to 6379.
         assert_eq!(take_pipeline_writes(name), vec![(6379, 1), (6379, 1)]);
