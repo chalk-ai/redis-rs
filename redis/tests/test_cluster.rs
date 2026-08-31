@@ -1130,6 +1130,60 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_survives_a_failed_rate_limited_refresh() {
+        // The refresh that follows a batch of MOVED hints is an optimisation, not
+        // the recovery mechanism: the hints and pinned redirects already route
+        // the retry. Its failure — likely on exactly the busy cluster that
+        // produced the redirects — must not fail the pipeline.
+        let name = "test_cluster_pipeline_survives_a_failed_rate_limited_refresh";
+        let moved_served = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(2)
+                .min_slot_refresh_interval(std::time::Duration::ZERO),
+            name,
+            {
+                let moved_served = moved_served.clone();
+                move |cmd: &[u8], port| {
+                    if moved_served.load(Ordering::SeqCst) > 0
+                        && contains_slice(cmd, b"CLUSTER")
+                        && contains_slice(cmd, b"SLOTS")
+                    {
+                        return Err(Err(RedisError::from(std::io::Error::other(
+                            "topology refresh unavailable",
+                        ))));
+                    }
+                    respond_startup(name, cmd)?;
+
+                    match port {
+                        6379 => {
+                            moved_served.fetch_add(1, Ordering::SeqCst);
+                            Err(parse_redis_value(
+                                format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                            ))
+                        }
+                        6380 => Err(Ok(redis_value!("one"))),
+                        _ => panic!("Wrong node: {port}"),
+                    }
+                }
+            },
+        );
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["one".to_string()]));
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 1), (6380, 1)]);
+    }
+
+    #[test]
     fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
         // A redirect the client can never satisfy is retried as a pipeline the
         // configured number of times, then reported.

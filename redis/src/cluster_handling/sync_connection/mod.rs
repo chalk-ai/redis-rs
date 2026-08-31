@@ -1796,8 +1796,12 @@ where
             self.refresh_slots()?;
         } else if refresh_rate_limited {
             // Having learned the new mappings first-hand, the full refresh is only
-            // about replica and node-set freshness, so it is safe to rate limit.
-            self.refresh_slots_rate_limited()?;
+            // about replica and node-set freshness: safe to rate limit, and safe
+            // to fail. Every pending command carries its own recovery (a recorded
+            // hint, a pinned redirect, or a plain retry), so a refresh error —
+            // likely on exactly the busy, resharding cluster that triggered the
+            // redirects — must not fail the whole pipeline.
+            let _ = self.refresh_slots_rate_limited();
         }
         if !sleep_time.is_zero() {
             thread::sleep(sleep_time);
