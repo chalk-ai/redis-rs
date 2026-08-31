@@ -1664,22 +1664,27 @@ where
     /// Out of attempts: record what the final round still taught us, then pick
     /// the error to surface.
     ///
-    /// The final round's MOVED hints are kept so later requests do not have to
-    /// rediscover them (a conflicting pair may record one stale hint; the next
-    /// MOVED corrects it at the cost of one redirect). The surfaced error is
-    /// deterministic — a terminal failure if there is one, else the earliest
-    /// command's — rather than whichever node happened to iterate first out of
-    /// a HashMap, where a retryable MOVED could mask a NoRetry error.
+    /// The final round's non-conflicting MOVED hints are kept so later requests
+    /// do not have to rediscover them. The surfaced error is deterministic — a
+    /// terminal failure if there is one, else the earliest command's — rather
+    /// than whichever node happened to iterate first out of a HashMap, where a
+    /// retryable MOVED could mask a NoRetry error.
     fn give_up_pipeline(&self, failed: Vec<PipelineCmdFailure>) -> RedisError {
-        let moved_hints: HashMap<u16, NodeAddress> = failed
-            .iter()
-            .filter(|failure| matches!(failure.error.retry_method(), RetryMethod::MovedRedirect))
-            .filter_map(|failure| {
-                failure.error.redirect_node().and_then(|(node, slot)| {
-                    NodeAddress::try_from(node).ok().map(|addr| (slot, addr))
-                })
-            })
-            .collect();
+        let mut moved_hints = HashMap::new();
+        let mut conflicting_moved_slots = HashSet::new();
+        for failure in &failed {
+            if matches!(failure.error.retry_method(), RetryMethod::MovedRedirect)
+                && let Some((node, slot)) = failure.error.redirect_node()
+                && let Ok(addr) = NodeAddress::try_from(node)
+            {
+                Self::record_moved_hint(
+                    &mut moved_hints,
+                    &mut conflicting_moved_slots,
+                    slot,
+                    &addr,
+                );
+            }
+        }
         self.slots.borrow_mut().update_slots(moved_hints);
 
         failed
@@ -1692,6 +1697,32 @@ where
             })
             .expect("the retry loop only gives up on a non-empty failure set")
             .error
+    }
+
+    /// Record one authoritative MOVED hint unless this response batch reports
+    /// different owners for the same slot. Returns whether this hint introduced
+    /// a conflict that requires a topology refresh while retries remain.
+    fn record_moved_hint(
+        moved_hints: &mut HashMap<u16, NodeAddress>,
+        conflicting_moved_slots: &mut HashSet<u16>,
+        slot: u16,
+        addr: &NodeAddress,
+    ) -> bool {
+        if conflicting_moved_slots.contains(&slot) {
+            return false;
+        }
+        match moved_hints.get(&slot) {
+            Some(existing) if existing != addr => {
+                moved_hints.remove(&slot);
+                conflicting_moved_slots.insert(slot);
+                true
+            }
+            Some(_) => false,
+            None => {
+                moved_hints.insert(slot, addr.clone());
+                false
+            }
+        }
     }
 
     /// Turn one attempt's failures into the next attempt's pending set, applying
@@ -1747,20 +1778,15 @@ where
                             // so collect it instead of discarding it and asking the
                             // cluster to describe all 16384 slots again. Identical
                             // hints are applied once after the whole response batch.
-                            if !conflicting_moved_slots.contains(&slot) {
-                                match moved_hints.get(&slot) {
-                                    Some(existing) if existing != &addr => {
-                                        moved_hints.remove(&slot);
-                                        conflicting_moved_slots.insert(slot);
-                                        // Two authoritative destinations in one
-                                        // response batch leave no safe map value.
-                                        refresh_now = true;
-                                    }
-                                    Some(_) => {}
-                                    None => {
-                                        moved_hints.insert(slot, addr.clone());
-                                    }
-                                }
+                            if Self::record_moved_hint(
+                                &mut moved_hints,
+                                &mut conflicting_moved_slots,
+                                slot,
+                                &addr,
+                            ) {
+                                // Two authoritative destinations in one response
+                                // batch leave no safe map value.
+                                refresh_now = true;
                             }
                             refresh_rate_limited = true;
                             pending.push(PendingCmd {

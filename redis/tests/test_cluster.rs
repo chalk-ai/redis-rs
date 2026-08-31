@@ -1195,6 +1195,127 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_keeps_a_final_round_moved_hint() {
+        let name = "test_cluster_pipeline_keeps_a_final_round_moved_hint";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(0)
+                .min_slot_refresh_interval(std::time::Duration::from_secs(3600)),
+            name,
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6380 => Err(Ok(redis_value!("one"))),
+                    _ => panic!("Wrong node: {port}"),
+                }
+            },
+        );
+
+        let first = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+        assert!(matches!(&first, Err(err) if err.kind() == ServerErrorKind::Moved.into()));
+
+        let second = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+        assert_eq!(second, Ok(vec!["one".to_string()]));
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 1), (6380, 1)]);
+    }
+
+    #[test]
+    fn test_cluster_pipeline_omits_conflicting_final_round_moved_hints() {
+        let name = "test_cluster_pipeline_omits_conflicting_final_round_moved_hints";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")]).retries(0),
+            name,
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 if contains_slice(cmd, b"key1") => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6379 if contains_slice(cmd, b"key2") => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6381\r\n").as_bytes(),
+                    )),
+                    6379 => Err(Ok(redis_value!("three"))),
+                    _ => panic!("Conflicting hint poisoned the slot map: {port}"),
+                }
+            },
+        );
+
+        let first = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .query::<Vec<String>>(&mut connection);
+        assert!(matches!(&first, Err(err) if err.kind() == ServerErrorKind::Moved.into()));
+
+        let second = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key3")
+            .query::<Vec<String>>(&mut connection);
+        assert_eq!(second, Ok(vec!["three".to_string()]));
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 2), (6379, 1)]);
+    }
+
+    #[test]
+    fn test_cluster_pipeline_prioritizes_a_terminal_error_on_give_up() {
+        let name = "test_cluster_pipeline_prioritizes_a_terminal_error_on_give_up";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")]).retries(0),
+            name,
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 if contains_slice(cmd, b"key1") => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6379 => Err(Err(RedisError::from((
+                        ErrorKind::Client,
+                        "terminal pipeline failure",
+                    )))),
+                    _ => panic!("Wrong node: {port}"),
+                }
+            },
+        );
+
+        let result = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .query::<Vec<String>>(&mut connection);
+
+        assert!(matches!(&result, Err(err) if err.kind() == ErrorKind::Client));
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 2)]);
+    }
+
+    #[test]
     fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
         // A redirect the client can never satisfy is retried as a pipeline the
         // configured number of times, then reported.
