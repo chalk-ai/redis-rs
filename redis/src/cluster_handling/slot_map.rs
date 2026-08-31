@@ -77,6 +77,16 @@ impl SlotMap {
     }
 
     /// Apply a batch of MOVED hints with one replica lookup and slot-range pass.
+    ///
+    /// Replica carry-over is resolved against a snapshot of the map as it stood
+    /// *before* the batch, so this is deliberately not always equivalent to
+    /// applying the same hints one by one through [`Self::update_slot`], which
+    /// re-scans after every hint. The cases diverge only when one batch both
+    /// evacuates a primary's last range and assigns another slot to that primary:
+    /// the snapshot still knows the replica set, sequential application would
+    /// not. Both outcomes route correctly (an empty replica set falls back to
+    /// the primary); the snapshot is preferred because the hints all describe
+    /// the same instant of cluster topology, not a sequence of states.
     pub(crate) fn update_slots(&mut self, updates: impl IntoIterator<Item = (u16, NodeAddress)>) {
         // Sorting also deduplicates repeated hints for the same slot. Conflicting
         // hints are resolved by the caller before they reach this method.
@@ -485,7 +495,30 @@ mod tests {
     }
 
     #[test]
+    fn update_slots_carries_replicas_from_the_pre_batch_map() {
+        // One batch both evacuates n1's last range and hands it slot 1500. The
+        // replica set comes from the pre-batch snapshot, so n1's replica is
+        // carried over; sequential `update_slot` application (evacuation first)
+        // would have found no n1 range and pinned reads to the primary. This
+        // pins the intended snapshot semantics.
+        let mut map = three_shards();
+        let mut updates: Vec<_> = (0..1000).map(|slot| (slot, addr("n3:6379"))).collect();
+        updates.push((1500, addr("n1:6379")));
+        map.update_slots(updates);
+
+        assert_eq!(primary_for(&map, 1500).as_deref(), Some("n1:6379"));
+        assert_eq!(replica_for(&map, 1500).as_deref(), Some("r1:6379"));
+        for slot in [0, 500, 999] {
+            assert_eq!(primary_for(&map, slot).as_deref(), Some("n3:6379"));
+        }
+    }
+
+    #[test]
     fn update_slots_matches_sequential_updates() {
+        // The generated hints never evacuate a primary's last range, so this
+        // stays inside the regime where batch and sequential application agree.
+        // The case where they deliberately diverge is pinned by
+        // `update_slots_carries_replicas_from_the_pre_batch_map`.
         let mut updates = Vec::new();
         let mut state: u64 = 7;
         for i in 0..1000 {
