@@ -1843,6 +1843,19 @@ impl Connection {
         }
     }
 
+    /// Records that the next `count` responses on this connection belong to a
+    /// reader that gave up on them: when they arrive they are discarded instead
+    /// of being handed to whoever reads next.
+    ///
+    /// This extends the single-message realignment `read` performs after a
+    /// timed-out response to a whole abandoned pipeline suffix, so the
+    /// connection can be reused instead of discarded. Only meaningful while the
+    /// socket is intact — a dropped or protocol-broken connection cannot be
+    /// realigned by counting.
+    pub(crate) fn abandon_replies(&mut self, count: usize) {
+        self.messages_to_skip += count;
+    }
+
     /// Fetches a single message from the connection. If the message is a response,
     /// increment `messages_to_skip` if it wasn't received before a timeout.
     fn read(&mut self, is_response: bool) -> RedisResult<Value> {

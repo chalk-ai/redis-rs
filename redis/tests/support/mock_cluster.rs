@@ -202,6 +202,15 @@ impl cluster::Connect for MockConnection {
         let cmd = self.pending.pop_front().unwrap_or_default();
         (self.handler)(&cmd, self.port).expect_err("Handler did not specify a response")
     }
+
+    fn abandon_responses(&mut self, count: usize) -> bool {
+        // The abandoned commands are dropped so their responses are never
+        // replayed to a later reader — the mock equivalent of the real
+        // connection discarding the frames as they arrive.
+        let drained = count.min(self.pending.len());
+        self.pending.drain(..drained);
+        true
+    }
 }
 
 /// Split a packed pipeline back into the commands that were written into it.

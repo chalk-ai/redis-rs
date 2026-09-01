@@ -209,6 +209,18 @@ pub trait Connect: Sized {
     /// Fetches a single response from the connection.  This is useful
     /// if used in combination with `send_packed_command`.
     fn recv_response(&mut self) -> RedisResult<Value>;
+
+    /// Discards the next `count` in-flight responses instead of handing them to
+    /// future readers, realigning a connection whose reader abandoned them
+    /// (e.g. a pipeline drain that stopped at a read timeout).
+    ///
+    /// Returns whether the connection supports this. `false` — the default —
+    /// means the caller must not reuse the connection and should discard it,
+    /// because unaccounted frames would be served as answers to the wrong
+    /// commands.
+    fn abandon_responses(&mut self, _count: usize) -> bool {
+        false
+    }
 }
 
 impl Connect for Connection {
@@ -233,6 +245,11 @@ impl Connect for Connection {
 
     fn recv_response(&mut self) -> RedisResult<Value> {
         Self::recv_response(self)
+    }
+
+    fn abandon_responses(&mut self, count: usize) -> bool {
+        self.abandon_replies(count);
+        true
     }
 }
 
@@ -1975,7 +1992,7 @@ where
                 }
             };
             let mut asking_error = None;
-            let mut drain_broke = false;
+            let mut drop_conn = false;
 
             for (response_idx, response) in nc.responses.iter().enumerate() {
                 let received = conn.recv_response();
@@ -1996,11 +2013,17 @@ where
                         // next round.
                         suffix_start = response_idx + 1;
                     }
-                    // This connection can no longer provide a trustworthy framed
-                    // response. Everything at and behind this position remains
-                    // unresolved and is retried on a repaired connection.
+                    // Everything at and behind this position remains unresolved
+                    // and is retried. The failed read already accounted for its
+                    // own frame (`messages_to_skip`); if the socket is intact —
+                    // a timeout, not a dropped or protocol-broken connection —
+                    // account for the rest of the suffix's frames the same way
+                    // and keep the connection. Anything else cannot be realigned
+                    // by counting and must not go back into the pool.
                     failed.extend(nc.failures_from_response(suffix_start, err.clone()));
-                    drain_broke = true;
+                    let intact = err.as_io_error().is_some() && !err.is_connection_dropped();
+                    drop_conn =
+                        !(intact && conn.abandon_responses(nc.responses.len() - response_idx - 1));
                     break;
                 }
 
@@ -2050,13 +2073,12 @@ where
                 }
             }
             debug_assert!(asking_error.is_none());
-            if drain_broke {
-                // The abandoned suffix's responses are still buffered on the
-                // socket. `messages_to_skip` realigns after exactly one failed
-                // read, not a whole suffix, so a reused connection would answer
-                // the next attempt's commands with this attempt's leftovers —
-                // even for errors whose retry method keeps the node (e.g. a read
-                // timeout). Drop the connection; the retry reconnects lazily.
+            if drop_conn {
+                // The socket is dead or its framing can't be trusted, so the
+                // abandoned suffix could not be accounted for. A reused
+                // connection would answer the next attempt's commands with this
+                // attempt's leftovers; drop it and let the retry reconnect
+                // lazily.
                 dropped_any |= connections.remove(&nc.addr).is_some();
             }
         }
