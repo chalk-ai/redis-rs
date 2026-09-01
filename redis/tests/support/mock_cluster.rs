@@ -60,6 +60,17 @@ pub fn set_pipeline_send_results(name: &str, results: Vec<RedisResult<()>>) {
         .insert(name.to_string(), results.into());
 }
 
+/// Every successful sync `connect`, per mock cluster, in order, as the port
+/// connected to. Lets tests assert whether an operation replaced connections
+/// or reused the ones it had.
+static CONNECTS: LazyLock<RwLock<HashMap<String, Vec<u16>>>> = LazyLock::new(Default::default);
+
+/// Take the ports of the sync connects recorded for `name` since the last call.
+#[allow(dead_code)]
+pub fn take_connects(name: &str) -> Vec<u16> {
+    CONNECTS.write().unwrap().remove(name).unwrap_or_default()
+}
+
 /// Ports whose sync `connect` fails with `ConnectionRefused`, per mock cluster.
 static CONNECT_ERRORS: LazyLock<RwLock<HashMap<String, HashSet<u16>>>> =
     LazyLock::new(Default::default);
@@ -136,6 +147,12 @@ impl cluster::Connect for MockConnection {
                 std::io::ErrorKind::ConnectionRefused,
             )));
         }
+        CONNECTS
+            .write()
+            .unwrap()
+            .entry(name.clone())
+            .or_default()
+            .push(port);
         Ok(MockConnection {
             handler: HANDLERS
                 .read()

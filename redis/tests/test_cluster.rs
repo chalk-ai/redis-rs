@@ -859,6 +859,69 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_keeps_the_connection_across_a_receive_timeout() {
+        // A read timeout leaves the socket alive with the abandoned suffix's
+        // frames still in flight. Those frames can be accounted for and
+        // discarded, so the connection must be realigned and reused — replacing
+        // it on every timeout turns a reshard's simultaneous timeouts into a
+        // reconnect stampede (observed as ~6,400 NewConnections/run and 20 s
+        // connect stalls in the 2026-08-31 reshard benchmark).
+        let name = "test_cluster_pipeline_keeps_the_connection_across_a_receive_timeout";
+        let key2_responses = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let key2_responses = key2_responses.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 if contains_slice(cmd, b"key1") => Err(Ok(redis_value!("one"))),
+                    6379 if contains_slice(cmd, b"key2") => {
+                        if key2_responses.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(Err(RedisError::from(std::io::Error::from(
+                                std::io::ErrorKind::TimedOut,
+                            ))))
+                        } else {
+                            Err(Ok(redis_value!("two")))
+                        }
+                    }
+                    6379 if contains_slice(cmd, b"key3") => Err(Ok(redis_value!("three"))),
+                    _ => panic!("Wrong node or command: port={port}, cmd={cmd:?}"),
+                }
+            }
+        });
+        // Discard the connects made while the client started up.
+        let _ = take_connects(name);
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .cmd("GET")
+            .arg("{x}key3")
+            .query::<Vec<String>>(&mut connection);
+
+        // Correct results prove the realignment: on a reused-but-unaccounted
+        // socket the retry would read key3's buffered answer as key2's.
+        assert_eq!(
+            value,
+            Ok(vec![
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+            ])
+        );
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 3), (6379, 2)]);
+        // The retry must reuse the timed-out connection, not replace it.
+        assert_eq!(take_connects(name), Vec::<u16>::new());
+    }
+
+    #[test]
     fn test_cluster_pipeline_ask_redirect_asks_inside_the_retry_pipeline() {
         // `ASKING` only covers the command that immediately follows it, so a
         // retried pipeline has to carry one per redirected command rather than one
