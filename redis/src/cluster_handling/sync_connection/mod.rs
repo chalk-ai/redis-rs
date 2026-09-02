@@ -1473,9 +1473,22 @@ where
 
         let mut retries = 0;
         let mut redirected = None::<Redirect>;
+        let mut pending_moved_hint = None::<(u16, NodeAddress)>;
         let mut excluded_read_nodes = Vec::new();
 
         loop {
+            if let Some((slot, addr)) = pending_moved_hint.take() {
+                // A MOVED target may already have left the cluster or be unreachable
+                // from this client. Publishing it before connecting would poison the
+                // shared slot map for later requests.
+                {
+                    let mut connections = self.connections.borrow_mut();
+                    self.get_connection_by_addr(&mut connections, &addr)?;
+                }
+                self.slots.borrow_mut().update_slot(slot, addr);
+                self.refresh_slots_rate_limited()?;
+            }
+
             // Get target address and response.
             let (addr, rv) = {
                 let mut connections = self.connections.borrow_mut();
@@ -1564,20 +1577,11 @@ where
                             });
                             match moved_to {
                                 Some((addr, slot)) => {
-                                    // A MOVED is authoritative about one slot's new
-                                    // owner, so record it instead of discarding it and
-                                    // asking the cluster to describe all 16384 slots
-                                    // again. This arm is MOVED-only: the ASK arm below
-                                    // must never do this, because an ASK slot is still
-                                    // owned by the node that issued the redirect.
-                                    //
-                                    // The borrow is scoped to this statement so it ends
-                                    // before the refresh borrows `slots` again.
-                                    self.slots.borrow_mut().update_slot(slot, addr.clone());
-                                    // Having learned the mapping first-hand, the full
-                                    // refresh is now only about replica and node-set
-                                    // freshness, so it is safe to rate limit.
-                                    self.refresh_slots_rate_limited()?;
+                                    // A reachable MOVED is authoritative about one
+                                    // slot's new owner. Connect before publishing the
+                                    // hint so an unreachable target cannot poison the
+                                    // shared map for later requests.
+                                    pending_moved_hint = Some((slot, addr.clone()));
                                     redirected = Some(Redirect::Moved(addr));
                                 }
                                 None => {

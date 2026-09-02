@@ -1664,6 +1664,45 @@ mod cluster {
     const TEST_KEY_SLOT: u16 = 6918;
 
     #[test]
+    fn test_cluster_moved_does_not_record_an_unreachable_target() {
+        let name = "moved_does_not_record_an_unreachable_target";
+        set_connect_errors(name, [6380]);
+        let requests_to_6379 = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let requests_to_6379 = requests_to_6379.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+                match port {
+                    6379 if requests_to_6379.fetch_add(1, Ordering::SeqCst) == 0 => {
+                        Err(parse_redis_value(
+                            format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                        ))
+                    }
+                    6379 => Err(Ok(redis_value!("one"))),
+                    _ => panic!("Wrong node: {port}"),
+                }
+            }
+        });
+        let _ = take_connect_attempts(name);
+
+        let result = cmd("GET").arg("{x}key1").query::<String>(&mut connection);
+        assert_matches!(result, Err(err) if err.kind() == ErrorKind::Io);
+        assert_eq!(take_connect_attempts(name), vec![6380]);
+
+        assert_eq!(
+            cmd("GET").arg("{x}key1").query::<String>(&mut connection),
+            Ok("one".to_string())
+        );
+        assert!(take_connect_attempts(name).is_empty());
+        assert_eq!(requests_to_6379.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn test_cluster_moved_updates_slot_map_without_a_full_refresh() {
         let name = "moved_updates_slot_map";
         let slot_refreshes = Arc::new(atomic::AtomicUsize::new(0));
