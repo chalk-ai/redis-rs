@@ -95,6 +95,7 @@ use crate::cluster_routing::{
     MultipleNodeRoutingInfo, ResponsePolicy, Routable, SingleNodeRoutingInfo, Slot, SlotAddr,
 };
 use crate::cmd::{Cmd, cmd};
+use crate::commands::is_readonly_cmd;
 use crate::connection::{Connection, ConnectionInfo, ConnectionLike, connect};
 use crate::errors::{ErrorKind, RedisError, RetryMethod};
 use crate::parser::parse_redis_value;
@@ -1690,6 +1691,34 @@ where
                 continue;
             }
 
+            // Regrouping read-only commands cannot change their effects. If any
+            // failed command may mutate state, preserve the legacy path for the
+            // whole failed set so retries retain their original ordering.
+            if !failed
+                .iter()
+                .all(|failure| Self::is_safe_to_retry_in_pipeline(&cmds[failure.pending.idx]))
+            {
+                let mut single_retries = failed;
+                single_retries.sort_by_key(|failure| failure.pending.idx);
+                if let Some(failure) = single_retries
+                    .iter()
+                    .find(|failure| !matches!(failure.error.kind(), ErrorKind::Server(_)))
+                {
+                    // Before pipeline retries were batched, transport failures
+                    // from the initial pipeline were returned to the caller.
+                    return Err(failure.error.clone());
+                }
+                self.refresh_slots()?;
+                for failure in single_retries {
+                    let retry_idx = failure.pending.idx;
+                    let cmd = &cmds[retry_idx];
+                    let routing = RoutingInfo::for_routable(cmd);
+                    results[retry_idx] = self.request(Input::Cmd(cmd), routing)?.into();
+                }
+                pending = Vec::new();
+                continue;
+            }
+
             let retry_limit = self.cluster_params.retry_params.number_of_retries;
             if failed
                 .iter()
@@ -1718,6 +1747,11 @@ where
                 }
             }
         }
+    }
+
+    fn is_safe_to_retry_in_pipeline(cmd: &Cmd) -> bool {
+        cmd.command()
+            .is_some_and(|command| is_readonly_cmd(&command))
     }
 
     /// Out of attempts: record what the final round still taught us, then pick

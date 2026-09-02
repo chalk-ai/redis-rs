@@ -504,40 +504,47 @@ mod cluster {
         // Both commands target the same slot, so they are sent as one sub-pipeline to the initial owner,
         // which reports the slot has moved.
         let name = "test_cluster_pipeline_moved_redirect";
+        let set_seen = Arc::new(atomic::AtomicBool::new(false));
 
         let MockEnv {
             mut connection,
             handler: _handler,
             ..
-        } = MockEnv::new(name, move |cmd: &[u8], port| {
-            respond_startup(name, cmd)?;
+        } = MockEnv::new(name, {
+            let set_seen = set_seen.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
 
-            if port == 6379 {
-                // Initial slot owner reports the slot moved. For the pipelined sub-commands
-                // this reply is returned via `recv_response` (cmd == &[]).
-                return Err(parse_redis_value(
-                    format!("-MOVED 123 {name}:6380\r\n").as_bytes(),
-                ));
-            }
+                if port == 6379 {
+                    // Initial slot owner reports the slot moved. For the pipelined sub-commands
+                    // this reply is returned via `recv_response` (cmd == &[]).
+                    return Err(parse_redis_value(
+                        format!("-MOVED 123 {name}:6380\r\n").as_bytes(),
+                    ));
+                }
 
-            // Redirect target serves the retried pipeline.
-            assert_eq!(port, 6380);
-            if contains_slice(cmd, b"GET") {
-                Err(Ok(redis_value!("val1")))
-            } else {
-                Err(Ok(redis_value!(simple: "OK")))
+                assert_eq!(port, 6380);
+                if contains_slice(cmd, b"GET") {
+                    assert!(!set_seen.load(Ordering::SeqCst));
+                    Err(Ok(redis_value!("old")))
+                } else {
+                    set_seen.store(true, Ordering::SeqCst);
+                    Err(Ok(redis_value!(simple: "OK")))
+                }
             }
         });
 
         let value = cluster_pipe()
+            .cmd("GET")
+            .arg("key1")
             .cmd("SET")
             .arg("key1")
             .arg("val1")
-            .cmd("GET")
-            .arg("key1")
             .query::<Vec<String>>(&mut connection);
 
-        assert_eq!(value, Ok(vec!["OK".to_string(), "val1".to_string()]));
+        assert_eq!(value, Ok(vec!["old".to_string(), "OK".to_string()]));
+        assert!(set_seen.load(Ordering::SeqCst));
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 2)]);
     }
 
     /// CRC16("x") % 16384, i.e. the slot every `{x}...` key routes to. Owned by
@@ -563,14 +570,61 @@ mod cluster {
                 6379 => Err(parse_redis_value(
                     format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
                 )),
-                6380 => {
-                    if contains_slice(cmd, b"GET") {
-                        Err(Ok(redis_value!("val1")))
-                    } else {
+                6380 if contains_slice(cmd, b"key1") => Err(Ok(redis_value!("val1"))),
+                6380 if contains_slice(cmd, b"key2") => Err(Ok(redis_value!("val2"))),
+                6380 if contains_slice(cmd, b"key3") => Err(Ok(redis_value!("val3"))),
+                _ => panic!("Wrong node"),
+            }
+        });
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .cmd("GET")
+            .arg("{x}key3")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(
+            value,
+            Ok(vec![
+                "val1".to_string(),
+                "val2".to_string(),
+                "val3".to_string()
+            ])
+        );
+        // One three-command write to the old owner, then one three-command write
+        // to the new one. Retrying command by command would leave the retries out
+        // of this list entirely, since those go through `req_command`.
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 3), (6380, 3)]);
+    }
+
+    #[test]
+    fn test_cluster_pipeline_mutations_keep_single_command_retries() {
+        let name = "test_cluster_pipeline_mutations_keep_single_command_retries";
+        let target_calls = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let target_calls = target_calls.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                match port {
+                    6379 => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6380 => {
+                        assert!(contains_slice(cmd, b"SET"));
+                        target_calls.fetch_add(1, Ordering::SeqCst);
                         Err(Ok(redis_value!(simple: "OK")))
                     }
+                    _ => panic!("Wrong node"),
                 }
-                _ => panic!("Wrong node"),
             }
         });
 
@@ -581,18 +635,13 @@ mod cluster {
             .cmd("SET")
             .arg("{x}key2")
             .arg("val2")
-            .cmd("GET")
-            .arg("{x}key1")
             .query::<Vec<String>>(&mut connection);
 
-        assert_eq!(
-            value,
-            Ok(vec!["OK".to_string(), "OK".to_string(), "val1".to_string()])
-        );
-        // One three-command write to the old owner, then one three-command write
-        // to the new one. Retrying command by command would leave the retries out
-        // of this list entirely, since those go through `req_command`.
-        assert_eq!(take_pipeline_writes(name), vec![(6379, 3), (6380, 3)]);
+        assert_eq!(value, Ok(vec!["OK".to_string(), "OK".to_string()]));
+        assert_eq!(target_calls.load(Ordering::SeqCst), 2);
+        // Only the initial request is pipelined. Mutations retain the legacy
+        // single-command retry path.
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 2)]);
     }
 
     #[test]
@@ -799,6 +848,45 @@ mod cluster {
             take_pipeline_writes(name),
             vec![(6379, 4), (6380, 3), (6380, 2)]
         );
+    }
+
+    #[test]
+    fn test_cluster_pipeline_returns_ambiguous_mutation_failure_without_retrying() {
+        let name = "test_cluster_pipeline_returns_ambiguous_mutation_failure_without_retrying";
+        let increment_responses = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, {
+            let increment_responses = increment_responses.clone();
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                assert_eq!(port, 6379);
+                assert!(contains_slice(cmd, b"INCR"));
+                if increment_responses.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Err(RedisError::from(std::io::Error::from(
+                        std::io::ErrorKind::ConnectionReset,
+                    ))))
+                } else {
+                    Err(Ok(redis_value!(2)))
+                }
+            }
+        });
+
+        let result = cluster_pipe()
+            .cmd("INCR")
+            .arg("{x}counter")
+            .query::<Vec<i64>>(&mut connection);
+
+        assert!(
+            matches!(&result, Err(err) if err.is_io_error()),
+            "{result:?}"
+        );
+        assert_eq!(increment_responses.load(Ordering::SeqCst), 1);
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 1)]);
     }
 
     #[test]
