@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, LazyLock, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use redis::{
@@ -46,6 +46,23 @@ static PIPELINE_SEND_RESULTS: LazyLock<RwLock<HashMap<String, VecDeque<RedisResu
 /// `req_command` instead.
 pub fn take_pipeline_writes(name: &str) -> Vec<PipelineWrite> {
     PIPELINE_WRITES
+        .write()
+        .unwrap()
+        .remove(name)
+        .unwrap_or_default()
+}
+
+/// When each packed pipeline write happened, per mock cluster name, in write
+/// order (parallel to what `take_pipeline_writes` returns). Lets tests assert
+/// scheduling — e.g. that a retry was NOT delayed behind another command's
+/// backoff.
+static PIPELINE_WRITE_TIMES: LazyLock<RwLock<HashMap<String, Vec<Instant>>>> =
+    LazyLock::new(Default::default);
+
+/// Take the write instants recorded for `name` since the last call.
+#[allow(dead_code)]
+pub fn take_pipeline_write_times(name: &str) -> Vec<Instant> {
+    PIPELINE_WRITE_TIMES
         .write()
         .unwrap()
         .remove(name)
@@ -174,6 +191,12 @@ impl cluster::Connect for MockConnection {
             .entry(self.name.clone())
             .or_default()
             .push((self.port, commands.len()));
+        PIPELINE_WRITE_TIMES
+            .write()
+            .unwrap()
+            .entry(self.name.clone())
+            .or_default()
+            .push(Instant::now());
         let result = PIPELINE_SEND_RESULTS
             .write()
             .unwrap()

@@ -1322,6 +1322,69 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_wait_and_retry_does_not_block_other_retries() {
+        // A TRYAGAIN backs off on its own clock (~1.28s at the default floor).
+        // A MOVED in the same batch must retry immediately instead of waiting
+        // out the other command's backoff, and the TRYAGAIN must still wait its
+        // full delay before its own retry.
+        let name = "test_cluster_pipeline_wait_and_retry_does_not_block_other_retries";
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], port| {
+            respond_startup(name, cmd)?;
+
+            match port {
+                6379 if contains_slice(cmd, b"slow") => {
+                    Err(parse_redis_value(b"-TRYAGAIN wait for it\r\n"))
+                }
+                // The MOVED both redirects the fast command and teaches the
+                // slot map, so the slow command's delayed retry also routes to
+                // 6380 and succeeds there.
+                6379 => Err(parse_redis_value(
+                    format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                )),
+                6380 if contains_slice(cmd, b"slow") => Err(Ok(redis_value!("slow-ok"))),
+                6380 => Err(Ok(redis_value!("moved-ok"))),
+                _ => panic!("Wrong node: {port}"),
+            }
+        });
+        let _ = take_pipeline_write_times(name);
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}slow")
+            .cmd("GET")
+            .arg("{x}moved")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(
+            value,
+            Ok(vec!["slow-ok".to_string(), "moved-ok".to_string()])
+        );
+        // Three writes: the original pair, the immediate MOVED retry alone, and
+        // the TRYAGAIN's retry alone after its backoff. The blocking behaviour
+        // produced two writes, with the MOVED retry held inside the slept round.
+        assert_eq!(
+            take_pipeline_writes(name),
+            vec![(6379, 2), (6380, 1), (6380, 1)]
+        );
+        let times = take_pipeline_write_times(name);
+        assert!(
+            times[1] - times[0] < std::time::Duration::from_millis(600),
+            "MOVED retry was delayed {:?} — it inherited the TRYAGAIN backoff",
+            times[1] - times[0],
+        );
+        assert!(
+            times[2] - times[0] >= std::time::Duration::from_millis(1200),
+            "TRYAGAIN retried after only {:?} — backoff not honoured",
+            times[2] - times[0],
+        );
+    }
+
+    #[test]
     fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
         // A redirect the client can never satisfy is retried as a pipeline the
         // configured number of times, then reported.
