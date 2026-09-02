@@ -1852,6 +1852,7 @@ impl Connection {
     /// connection can be reused instead of discarded. Only meaningful while the
     /// socket is intact — a dropped or protocol-broken connection cannot be
     /// realigned by counting.
+    #[cfg(feature = "cluster")]
     pub(crate) fn abandon_replies(&mut self, count: usize) {
         self.messages_to_skip += count;
     }
