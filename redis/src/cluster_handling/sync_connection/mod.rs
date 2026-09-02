@@ -63,7 +63,7 @@
 //! let _: redis::Value = connection.route_command(&redis::cmd("PING"), routing_info).unwrap();
 //! ```
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1663,7 +1663,7 @@ where
         let mut results = vec![Value::Nil; cmds.len()];
 
         let mut pending: Vec<PendingCmd> = (0..cmds.len()).map(PendingCmd::new).collect();
-        let mut delayed: Vec<DelayedCmd> = Vec::new();
+        let mut delayed: BTreeMap<Instant, Vec<PendingCmd>> = BTreeMap::new();
 
         loop {
             // Promote delayed commands whose backoff has elapsed. Commands that
@@ -1671,13 +1671,18 @@ where
             // (e.g. TRYAGAIN or LOADING) sleeps on its own clock while redirects
             // and reconnects in the same batch retry immediately.
             let now = Instant::now();
-            let (ripe, still_waiting): (Vec<_>, Vec<_>) =
-                delayed.into_iter().partition(|d| d.wake_at <= now);
-            delayed = still_waiting;
-            pending.extend(ripe.into_iter().map(|d| d.pending));
+            while delayed
+                .first_key_value()
+                .is_some_and(|(wake_at, _)| *wake_at <= now)
+            {
+                let Some((_, ripe)) = delayed.pop_first() else {
+                    break;
+                };
+                pending.extend(ripe);
+            }
 
             if pending.is_empty() {
-                let Some(next_wake) = delayed.iter().map(|d| d.wake_at).min() else {
+                let Some((&next_wake, _)) = delayed.first_key_value() else {
                     return Ok(results);
                 };
                 thread::sleep(next_wake.saturating_duration_since(Instant::now()));
@@ -1737,16 +1742,18 @@ where
                 unreachable_redirect_targets,
             } = self.plan_pipeline_retry(failed)?;
             pending = ready;
-            delayed.extend(newly_delayed);
+            for delayed_cmd in newly_delayed {
+                delayed
+                    .entry(delayed_cmd.wake_at)
+                    .or_default()
+                    .push(delayed_cmd.pending);
+            }
 
             // This loop owns every command that can run again, including ones
             // delayed by an earlier response batch, so recovery invalidations
             // must be applied here rather than only to the new retry plan.
             if !unreachable_redirect_targets.is_empty() {
-                for cmd in pending
-                    .iter_mut()
-                    .chain(delayed.iter_mut().map(|d| &mut d.pending))
-                {
+                for cmd in pending.iter_mut().chain(delayed.values_mut().flatten()) {
                     cmd.unpin_if_target_in(&unreachable_redirect_targets);
                 }
             }
