@@ -1698,9 +1698,25 @@ where
                 return Err(self.give_up_pipeline(failed, retry_limit));
             }
 
-            let plan = self.plan_pipeline_retry(failed)?;
-            pending = plan.ready;
-            delayed.extend(plan.delayed);
+            let PipelineRetryPlan {
+                ready,
+                delayed: newly_delayed,
+                unreachable_redirect_targets,
+            } = self.plan_pipeline_retry(failed)?;
+            pending = ready;
+            delayed.extend(newly_delayed);
+
+            // This loop owns every command that can run again, including ones
+            // delayed by an earlier response batch, so recovery invalidations
+            // must be applied here rather than only to the new retry plan.
+            if !unreachable_redirect_targets.is_empty() {
+                for cmd in pending
+                    .iter_mut()
+                    .chain(delayed.iter_mut().map(|d| &mut d.pending))
+                {
+                    cmd.unpin_if_target_in(&unreachable_redirect_targets);
+                }
+            }
         }
     }
 
@@ -1874,24 +1890,11 @@ where
         }
 
         self.slots.borrow_mut().update_slots(moved_hints);
-        let unrepaired = self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
-        if !unrepaired.is_empty() {
-            // A redirect pinned to a node we cannot reach would stick for the
-            // whole retry budget, overriding whatever the slot map learns in the
-            // meantime. Unpin those commands so the map routes them, and ask for
-            // an immediate refresh so it has a chance to know better. Unlike a
-            // usable MOVED redirect, unpinning has no recovery path while the
-            // slot map still names the unreachable node.
-            for cmd in ready
-                .iter_mut()
-                .chain(delayed.iter_mut().map(|d| &mut d.pending))
-            {
-                if let Some(Redirect::Moved(addr) | Redirect::Ask(addr)) = &cmd.redirect
-                    && unrepaired.contains(addr)
-                {
-                    cmd.redirect = None;
-                }
-            }
+        let unreachable_redirect_targets =
+            self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
+        if !unreachable_redirect_targets.is_empty() {
+            // The scheduler unpins every queued command targeting these nodes.
+            // Refresh immediately so routing through the slot map can recover.
             refresh_now = true;
         }
 
@@ -1913,7 +1916,11 @@ where
             let _ = self.refresh_slots_rate_limited();
         }
 
-        Ok(PipelineRetryPlan { ready, delayed })
+        Ok(PipelineRetryPlan {
+            ready,
+            delayed,
+            unreachable_redirect_targets,
+        })
     }
 
     /// Repair connections that failed during one pipeline attempt.
@@ -2236,6 +2243,16 @@ impl PendingCmd {
             retries: 0,
         }
     }
+
+    /// Stop overriding the slot map when recovery cannot reach this command's
+    /// redirect target.
+    fn unpin_if_target_in(&mut self, targets: &HashSet<NodeAddress>) {
+        if let Some(Redirect::Moved(addr) | Redirect::Ask(addr)) = &self.redirect
+            && targets.contains(addr)
+        {
+            self.redirect = None;
+        }
+    }
 }
 
 /// A command whose retry is backing off (`WaitAndRetry`, e.g. TRYAGAIN or
@@ -2247,10 +2264,12 @@ struct DelayedCmd {
     pending: PendingCmd,
 }
 
-/// One retry round's output: commands to send now, and commands backing off.
+/// One retry round's output, including recovery effects that the scheduler must
+/// apply to commands retained from earlier rounds.
 struct PipelineRetryPlan {
     ready: Vec<PendingCmd>,
     delayed: Vec<DelayedCmd>,
+    unreachable_redirect_targets: HashSet<NodeAddress>,
 }
 
 #[derive(Debug)]

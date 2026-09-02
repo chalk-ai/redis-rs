@@ -88,6 +88,21 @@ pub fn take_connects(name: &str) -> Vec<u16> {
     CONNECTS.write().unwrap().remove(name).unwrap_or_default()
 }
 
+/// Every attempted sync `connect`, including attempts configured to fail.
+static CONNECT_ATTEMPTS: LazyLock<RwLock<HashMap<String, Vec<u16>>>> =
+    LazyLock::new(Default::default);
+
+/// Take the ports of the sync connect attempts recorded for `name` since the
+/// last call.
+#[allow(dead_code)]
+pub fn take_connect_attempts(name: &str) -> Vec<u16> {
+    CONNECT_ATTEMPTS
+        .write()
+        .unwrap()
+        .remove(name)
+        .unwrap_or_default()
+}
+
 /// Ports whose sync `connect` fails with `ConnectionRefused`, per mock cluster.
 static CONNECT_ERRORS: LazyLock<RwLock<HashMap<String, HashSet<u16>>>> =
     LazyLock::new(Default::default);
@@ -154,6 +169,12 @@ impl cluster::Connect for MockConnection {
             redis::ConnectionAddr::Tcp(addr, port) => (addr, *port),
             _ => unreachable!(),
         };
+        CONNECT_ATTEMPTS
+            .write()
+            .unwrap()
+            .entry(name.clone())
+            .or_default()
+            .push(port);
         if CONNECT_ERRORS
             .read()
             .unwrap()

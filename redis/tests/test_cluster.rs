@@ -1104,6 +1104,90 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_unpins_redirects_already_in_the_delayed_queue() {
+        // The slow command is already backing off with a 6380 redirect when the
+        // fast command discovers that 6380 is unreachable. Recovery must unpin
+        // both commands, including the one retained by the outer scheduler.
+        let name = "test_cluster_pipeline_unpins_redirects_already_in_the_delayed_queue";
+        let slow_on_initial = Arc::new(atomic::AtomicUsize::new(0));
+        let fast_on_initial = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(6)
+                .min_retry_wait(100)
+                .max_retry_wait(101),
+            name,
+            {
+                let slow_on_initial = slow_on_initial.clone();
+                let fast_on_initial = fast_on_initial.clone();
+                move |cmd: &[u8], port| {
+                    respond_startup(name, cmd)?;
+
+                    if contains_slice(cmd, b"slow") {
+                        return match port {
+                            6379 if slow_on_initial.fetch_add(1, Ordering::SeqCst) == 0 => {
+                                Err(parse_redis_value(
+                                    format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                                ))
+                            }
+                            6379 => Err(Ok(redis_value!("slow-ok"))),
+                            6380 => Err(parse_redis_value(b"-TRYAGAIN wait for it\r\n")),
+                            _ => panic!("Wrong node for slow command: {port}"),
+                        };
+                    }
+
+                    match port {
+                        6379 if fast_on_initial.fetch_add(1, Ordering::SeqCst) == 0 => {
+                            Err(parse_redis_value(
+                                format!("-MOVED {X_TAG_SLOT} {name}:6381\r\n").as_bytes(),
+                            ))
+                        }
+                        6379 => Err(Ok(redis_value!("fast-ok"))),
+                        6381 => Err(parse_redis_value(
+                            format!("-MOVED {X_TAG_SLOT} {name}:6382\r\n").as_bytes(),
+                        )),
+                        6382 => Err(parse_redis_value(
+                            format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                        )),
+                        6380 => {
+                            // Drop the live connection, then make recovery fail.
+                            set_connect_errors(name, [6380]);
+                            Err(Err(RedisError::from(std::io::Error::from(
+                                std::io::ErrorKind::ConnectionReset,
+                            ))))
+                        }
+                        _ => panic!("Wrong node for fast command: {port}"),
+                    }
+                }
+            },
+        );
+        // Ignore the initial node connection; the assertion below starts with
+        // the retry pipelines.
+        let _ = take_connect_attempts(name);
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}slow")
+            .cmd("GET")
+            .arg("{x}fast")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(
+            value,
+            Ok(vec!["slow-ok".to_string(), "fast-ok".to_string()])
+        );
+        let attempts = take_connect_attempts(name);
+        // 6380 is attempted once for the first redirected pipeline and once by
+        // recovery. A later attempt means the delayed command kept its stale pin.
+        assert_eq!(attempts.iter().filter(|&&port| port == 6380).count(), 2);
+    }
+
+    #[test]
     fn test_cluster_pipeline_routes_an_uncovered_slot_to_a_random_node() {
         // A refresh that races a reshard can return a slot map with a gap. A
         // command in the gap must bounce off some node and follow the MOVED it
