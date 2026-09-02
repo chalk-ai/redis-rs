@@ -73,7 +73,27 @@ impl SlotMap {
             .map(|addrs| addrs.replicas.clone())
             .unwrap_or_default();
 
-        self.update_slot_with_replicas(slot, primary, replicas);
+        let Some((start, end)) = self.slots.range_containing(slot) else {
+            self.slots
+                .insert(slot, slot, SlotAddrs::new(primary, replicas));
+            return;
+        };
+        let Some((_, old)) = self.slots.remove_range(end) else {
+            return;
+        };
+        if start < slot {
+            self.slots.insert(
+                start,
+                slot - 1,
+                SlotAddrs::new(old.primary.clone(), old.replicas.clone()),
+            );
+        }
+        if slot < end {
+            self.slots
+                .insert(slot + 1, end, SlotAddrs::new(old.primary, old.replicas));
+        }
+        self.slots
+            .insert(slot, slot, SlotAddrs::new(primary, replicas));
     }
 
     /// Apply a batch of MOVED hints with one replica lookup and slot-range pass.
@@ -116,35 +136,6 @@ impl SlotMap {
                 })
                 .collect(),
         );
-    }
-
-    fn update_slot_with_replicas(
-        &mut self,
-        slot: u16,
-        primary: NodeAddress,
-        replicas: Vec<NodeAddress>,
-    ) {
-        let Some((start, end)) = self.slots.range_containing(slot) else {
-            self.slots
-                .insert(slot, slot, SlotAddrs::new(primary, replicas));
-            return;
-        };
-        let Some((_, old)) = self.slots.remove_range(end) else {
-            return;
-        };
-        if start < slot {
-            self.slots.insert(
-                start,
-                slot - 1,
-                SlotAddrs::new(old.primary.clone(), old.replicas.clone()),
-            );
-        }
-        if slot < end {
-            self.slots
-                .insert(slot + 1, end, SlotAddrs::new(old.primary, old.replicas));
-        }
-        self.slots
-            .insert(slot, slot, SlotAddrs::new(primary, replicas));
     }
 
     pub fn slot_addr_for_route(

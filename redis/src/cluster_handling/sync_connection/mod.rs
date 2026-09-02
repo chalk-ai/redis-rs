@@ -1675,10 +1675,10 @@ where
                 .first_key_value()
                 .is_some_and(|(wake_at, _)| *wake_at <= now)
             {
-                let Some((_, ripe)) = delayed.pop_first() else {
+                let Some((_, ready)) = delayed.pop_first() else {
                     break;
                 };
-                pending.extend(ripe);
+                pending.extend(ready);
             }
 
             if pending.is_empty() {
