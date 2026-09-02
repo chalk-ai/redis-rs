@@ -1700,6 +1700,16 @@ where
                 continue;
             }
 
+            if !*self.auto_reconnect.borrow()
+                && let Some(failure) = failed
+                    .iter()
+                    .find(|failure| !matches!(failure.error.kind(), ErrorKind::Server(_)))
+            {
+                // Retrying a transport failure may require replacing a connection;
+                // preserve the caller's opt-out instead of reconnecting indirectly.
+                return Err(failure.error.clone());
+            }
+
             // Regrouping read-only commands cannot change their effects. If any
             // failed command may mutate state, preserve the legacy path for the
             // whole failed set so retries retain their original ordering.

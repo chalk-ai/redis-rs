@@ -788,6 +788,38 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_does_not_reconnect_when_disabled() {
+        let name = "test_cluster_pipeline_does_not_reconnect_when_disabled";
+        set_pipeline_send_results(
+            name,
+            vec![Err(RedisError::from(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            )))],
+        );
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::new(name, move |cmd: &[u8], port| {
+            respond_startup(name, cmd)?;
+            assert_eq!(port, 6379);
+            Err(Ok(redis_value!("one")))
+        });
+        connection.set_auto_reconnect(false);
+        let _ = take_connect_attempts(name);
+
+        let result = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_matches!(result, Err(err) if err.kind() == ErrorKind::Io);
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 1)]);
+        assert!(take_connect_attempts(name).is_empty());
+    }
+
+    #[test]
     fn test_cluster_pipeline_recovers_retry_receive_failure_for_unresolved_commands() {
         let name = "test_cluster_pipeline_recovers_retry_receive_failure_for_unresolved_commands";
         let key2_responses = Arc::new(atomic::AtomicUsize::new(0));
