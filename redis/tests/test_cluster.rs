@@ -1557,6 +1557,48 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_wait_and_retry_preserves_failure_cohorts() {
+        let name = "test_cluster_pipeline_wait_and_retry_preserves_failure_cohorts";
+        let responses = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(1)
+                .min_retry_wait(100)
+                .max_retry_wait(101),
+            name,
+            {
+                let responses = responses.clone();
+                move |cmd: &[u8], port| {
+                    respond_startup(name, cmd)?;
+                    assert_eq!(port, 6379);
+                    if responses.fetch_add(1, Ordering::SeqCst) < 3 {
+                        Err(parse_redis_value(b"-TRYAGAIN wait for it\r\n"))
+                    } else {
+                        Err(Ok(redis_value!("ok")))
+                    }
+                }
+            },
+        );
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}key1")
+            .cmd("GET")
+            .arg("{x}key2")
+            .cmd("GET")
+            .arg("{x}key3")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(value, Ok(vec!["ok".to_string(); 3]));
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 3), (6379, 3)]);
+    }
+
+    #[test]
     fn test_cluster_pipeline_delayed_commands_keep_their_own_retry_budget() {
         // The fast command uses both of its retries while the slow command is
         // backing off. The slow command must still receive both configured

@@ -1842,6 +1842,8 @@ where
         let mut terminal_error = None;
         let mut moved_hints = HashMap::new();
         let mut conflicting_moved_slots = HashSet::new();
+        let retry_now = Instant::now();
+        let mut wait_deadlines = HashMap::new();
 
         for failure in failed {
             let PipelineCmdFailure {
@@ -1900,15 +1902,18 @@ where
                     }
                 }
                 RetryMethod::WaitAndRetry => {
-                    // Back off on this command's own clock instead of sleeping
-                    // the whole round: the send loop retries it once its wake
-                    // time passes, without holding up the other commands.
-                    let wait = self
-                        .cluster_params
-                        .retry_params
-                        .wait_time_for_retry(failed_cmd.retries);
+                    // Commands that fail together at the same retry count share
+                    // one jittered deadline, so they wake as a pipeline instead
+                    // of fragmenting into independently timed requests.
+                    let wake_at = *wait_deadlines.entry(failed_cmd.retries).or_insert_with(|| {
+                        retry_now
+                            + self
+                                .cluster_params
+                                .retry_params
+                                .wait_time_for_retry(failed_cmd.retries)
+                    });
                     delayed.push(DelayedCmd {
-                        wake_at: Instant::now() + wait,
+                        wake_at,
                         pending: failed_cmd,
                     });
                 }
