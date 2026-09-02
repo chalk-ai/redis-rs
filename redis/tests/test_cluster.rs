@@ -1385,6 +1385,68 @@ mod cluster {
     }
 
     #[test]
+    fn test_cluster_pipeline_delayed_commands_keep_their_own_retry_budget() {
+        // The fast command uses both of its retries while the slow command is
+        // backing off. The slow command must still receive both configured
+        // retries rather than inheriting the fast command's exhausted budget.
+        let name = "test_cluster_pipeline_delayed_commands_keep_their_own_retry_budget";
+        let slow_calls = Arc::new(atomic::AtomicUsize::new(0));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(2)
+                .min_retry_wait(100)
+                .max_retry_wait(101),
+            name,
+            {
+                let slow_calls = slow_calls.clone();
+                move |cmd: &[u8], port| {
+                    respond_startup(name, cmd)?;
+
+                    if contains_slice(cmd, b"slow") {
+                        return if slow_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                            Err(parse_redis_value(b"-TRYAGAIN wait for it\r\n"))
+                        } else {
+                            Err(Ok(redis_value!("slow-ok")))
+                        };
+                    }
+                    match port {
+                        6379 => Err(parse_redis_value(
+                            format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                        )),
+                        6380 => Err(parse_redis_value(
+                            format!("-MOVED {X_TAG_SLOT} {name}:6381\r\n").as_bytes(),
+                        )),
+                        6381 => Err(Ok(redis_value!("fast-ok"))),
+                        _ => panic!("Wrong node: {port}"),
+                    }
+                }
+            },
+        );
+
+        let value = cluster_pipe()
+            .cmd("GET")
+            .arg("{x}slow")
+            .cmd("GET")
+            .arg("{x}fast")
+            .query::<Vec<String>>(&mut connection);
+
+        assert_eq!(
+            value,
+            Ok(vec!["slow-ok".to_string(), "fast-ok".to_string()])
+        );
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            take_pipeline_writes(name),
+            vec![(6379, 2), (6380, 1), (6381, 1), (6381, 1), (6381, 1),]
+        );
+    }
+
+    #[test]
     fn test_cluster_pipeline_gives_up_after_the_configured_retries() {
         // A redirect the client can never satisfy is retried as a pipeline the
         // configured number of times, then reported.
