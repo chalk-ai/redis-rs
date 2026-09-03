@@ -1,3 +1,9 @@
+### Unreleased
+
+#### Changes & Bug fixes
+
+* Add `REDIS_COMMAND_LOG_PATH` / `REDIS_COMMAND_TEE` env vars to mirror every command a connection sends, MONITOR-style, to a per-connection file and/or a UDP endpoint ([#5](https://github.com/chalk-ai/redis-rs/pull/5))
+
 ### 1.2.1 (2026-05-03)
 
 #### Changes & Bug fixes

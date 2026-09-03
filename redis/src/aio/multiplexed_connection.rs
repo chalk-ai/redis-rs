@@ -103,6 +103,9 @@ struct PipelineMessage {
 #[derive(Clone)]
 struct Pipeline {
     sender: mpsc::Sender<PipelineMessage>,
+    /// Optional environment-driven command logger (see [`crate::command_logger`]).
+    /// Shared across clones so a multiplexed connection has a single uuid/log file.
+    command_logger: Option<Arc<crate::command_logger::CommandLogger>>,
 }
 
 impl Debug for Pipeline {
@@ -437,7 +440,15 @@ impl Pipeline {
             .map(Ok)
             .forward(sink)
             .map(|_| ());
-        (Pipeline { sender }, f)
+        let command_logger =
+            crate::command_logger::CommandLogger::for_new_connection().map(Arc::new);
+        (
+            Pipeline {
+                sender,
+                command_logger,
+            },
+            f,
+        )
     }
 
     async fn send_recv(
@@ -451,6 +462,10 @@ impl Pipeline {
     ) -> Result<Value, RedisError> {
         if input.is_empty() {
             return Err(RedisError::make_empty_command());
+        }
+
+        if let Some(logger) = &self.command_logger {
+            logger.log(&input);
         }
 
         let request = async {

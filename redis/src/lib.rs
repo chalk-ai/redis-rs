@@ -822,6 +822,7 @@ pub mod auth_management;
 
 mod client;
 mod cmd;
+mod command_logger;
 mod commands;
 mod connection;
 mod errors;
