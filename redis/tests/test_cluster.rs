@@ -1224,90 +1224,6 @@ mod cluster {
     }
 
     #[test]
-    fn test_cluster_pipeline_unpins_redirects_already_in_the_delayed_queue() {
-        // The slow command is already backing off with a 6380 redirect when the
-        // fast command discovers that 6380 is unreachable. Recovery must unpin
-        // both commands, including the one retained by the outer scheduler.
-        let name = "test_cluster_pipeline_unpins_redirects_already_in_the_delayed_queue";
-        let slow_on_initial = Arc::new(atomic::AtomicUsize::new(0));
-        let fast_on_initial = Arc::new(atomic::AtomicUsize::new(0));
-
-        let MockEnv {
-            mut connection,
-            handler: _handler,
-            ..
-        } = MockEnv::with_client_builder(
-            ClusterClient::builder(vec![&*format!("redis://{name}")])
-                .retries(6)
-                .min_retry_wait(100)
-                .max_retry_wait(101),
-            name,
-            {
-                let slow_on_initial = slow_on_initial.clone();
-                let fast_on_initial = fast_on_initial.clone();
-                move |cmd: &[u8], port| {
-                    respond_startup(name, cmd)?;
-
-                    if contains_slice(cmd, b"slow") {
-                        return match port {
-                            6379 if slow_on_initial.fetch_add(1, Ordering::SeqCst) == 0 => {
-                                Err(parse_redis_value(
-                                    format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
-                                ))
-                            }
-                            6379 => Err(Ok(redis_value!("slow-ok"))),
-                            6380 => Err(parse_redis_value(b"-TRYAGAIN wait for it\r\n")),
-                            _ => panic!("Wrong node for slow command: {port}"),
-                        };
-                    }
-
-                    match port {
-                        6379 if fast_on_initial.fetch_add(1, Ordering::SeqCst) == 0 => {
-                            Err(parse_redis_value(
-                                format!("-MOVED {X_TAG_SLOT} {name}:6381\r\n").as_bytes(),
-                            ))
-                        }
-                        6379 => Err(Ok(redis_value!("fast-ok"))),
-                        6381 => Err(parse_redis_value(
-                            format!("-MOVED {X_TAG_SLOT} {name}:6382\r\n").as_bytes(),
-                        )),
-                        6382 => Err(parse_redis_value(
-                            format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
-                        )),
-                        6380 => {
-                            // Drop the live connection, then make recovery fail.
-                            set_connect_errors(name, [6380]);
-                            Err(Err(RedisError::from(std::io::Error::from(
-                                std::io::ErrorKind::ConnectionReset,
-                            ))))
-                        }
-                        _ => panic!("Wrong node for fast command: {port}"),
-                    }
-                }
-            },
-        );
-        // Ignore the initial node connection; the assertion below starts with
-        // the retry pipelines.
-        let _ = take_connect_attempts(name);
-
-        let value = cluster_pipe()
-            .cmd("GET")
-            .arg("{x}slow")
-            .cmd("GET")
-            .arg("{x}fast")
-            .query::<Vec<String>>(&mut connection);
-
-        assert_eq!(
-            value,
-            Ok(vec!["slow-ok".to_string(), "fast-ok".to_string()])
-        );
-        let attempts = take_connect_attempts(name);
-        // 6380 is attempted once for the first redirected pipeline and once by
-        // recovery. A later attempt means the delayed command kept its stale pin.
-        assert_eq!(attempts.iter().filter(|&&port| port == 6380).count(), 2);
-    }
-
-    #[test]
     fn test_cluster_pipeline_routes_an_uncovered_slot_to_a_random_node() {
         // A refresh that races a reshard can return a slot map with a gap. A
         // command in the gap must bounce off some node and follow the MOVED it
@@ -1526,35 +1442,45 @@ mod cluster {
     }
 
     #[test]
-    fn test_cluster_pipeline_wait_and_retry_does_not_block_other_retries() {
-        // A TRYAGAIN backs off on its own clock (~1.28s at the default floor).
-        // A MOVED in the same batch must retry immediately instead of waiting
-        // out the other command's backoff, and the TRYAGAIN must still wait its
-        // full delay before its own retry.
-        let name = "test_cluster_pipeline_wait_and_retry_does_not_block_other_retries";
+    fn test_cluster_pipeline_wait_and_retry_paces_the_whole_round() {
+        // A TRYAGAIN backoff paces the whole retry round: a MOVED in the same
+        // batch waits out the shared sleep and both commands retry together as
+        // one regrouped pipeline. This bounds connection recovery and topology
+        // refreshes to at most one pass per backoff during a reshard, instead
+        // of letting redirected commands spin recovery rounds at network speed
+        // while a sibling command backs off (measured as 2-4x connection and
+        // CLUSTER-command churn against a live resharding cluster).
+        let name = "test_cluster_pipeline_wait_and_retry_paces_the_whole_round";
 
         let MockEnv {
             mut connection,
             handler: _handler,
             ..
-        } = MockEnv::new(name, move |cmd: &[u8], port| {
-            respond_startup(name, cmd)?;
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(2)
+                .min_retry_wait(300)
+                .max_retry_wait(301),
+            name,
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
 
-            match port {
-                6379 if contains_slice(cmd, b"slow") => {
-                    Err(parse_redis_value(b"-TRYAGAIN wait for it\r\n"))
+                match port {
+                    6379 if contains_slice(cmd, b"slow") => {
+                        Err(parse_redis_value(b"-TRYAGAIN wait for it\r\n"))
+                    }
+                    // The MOVED both redirects the fast command and teaches the
+                    // slot map, so the slow command's paced retry also routes
+                    // to 6380 and succeeds there.
+                    6379 => Err(parse_redis_value(
+                        format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
+                    )),
+                    6380 if contains_slice(cmd, b"slow") => Err(Ok(redis_value!("slow-ok"))),
+                    6380 => Err(Ok(redis_value!("moved-ok"))),
+                    _ => panic!("Wrong node: {port}"),
                 }
-                // The MOVED both redirects the fast command and teaches the
-                // slot map, so the slow command's delayed retry also routes to
-                // 6380 and succeeds there.
-                6379 => Err(parse_redis_value(
-                    format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
-                )),
-                6380 if contains_slice(cmd, b"slow") => Err(Ok(redis_value!("slow-ok"))),
-                6380 => Err(Ok(redis_value!("moved-ok"))),
-                _ => panic!("Wrong node: {port}"),
-            }
-        });
+            },
+        );
         let _ = take_pipeline_write_times(name);
 
         let value = cluster_pipe()
@@ -1568,23 +1494,15 @@ mod cluster {
             value,
             Ok(vec!["slow-ok".to_string(), "moved-ok".to_string()])
         );
-        // Three writes: the original pair, the immediate MOVED retry alone, and
-        // the TRYAGAIN's retry alone after its backoff. The blocking behaviour
-        // produced two writes, with the MOVED retry held inside the slept round.
-        assert_eq!(
-            take_pipeline_writes(name),
-            vec![(6379, 2), (6380, 1), (6380, 1)]
-        );
+        // Two writes: the original pair, then one regrouped retry pipeline
+        // after the shared backoff. Unpaced scheduling produced three writes,
+        // with the MOVED command retrying alone at network speed.
+        assert_eq!(take_pipeline_writes(name), vec![(6379, 2), (6380, 2)]);
         let times = take_pipeline_write_times(name);
         assert!(
-            times[1] - times[0] < std::time::Duration::from_millis(600),
-            "MOVED retry was delayed {:?} — it inherited the TRYAGAIN backoff",
+            times[1] - times[0] >= std::time::Duration::from_millis(280),
+            "retry round started after only {:?} — the WaitAndRetry backoff did not pace the round",
             times[1] - times[0],
-        );
-        assert!(
-            times[2] - times[0] >= std::time::Duration::from_millis(1200),
-            "TRYAGAIN retried after only {:?} — backoff not honoured",
-            times[2] - times[0],
         );
     }
 
@@ -1628,68 +1546,6 @@ mod cluster {
 
         assert_eq!(value, Ok(vec!["ok".to_string(); 3]));
         assert_eq!(take_pipeline_writes(name), vec![(6379, 3), (6379, 3)]);
-    }
-
-    #[test]
-    fn test_cluster_pipeline_delayed_commands_keep_their_own_retry_budget() {
-        // The fast command uses both of its retries while the slow command is
-        // backing off. The slow command must still receive both configured
-        // retries rather than inheriting the fast command's exhausted budget.
-        let name = "test_cluster_pipeline_delayed_commands_keep_their_own_retry_budget";
-        let slow_calls = Arc::new(atomic::AtomicUsize::new(0));
-
-        let MockEnv {
-            mut connection,
-            handler: _handler,
-            ..
-        } = MockEnv::with_client_builder(
-            ClusterClient::builder(vec![&*format!("redis://{name}")])
-                .retries(2)
-                .min_retry_wait(100)
-                .max_retry_wait(101),
-            name,
-            {
-                let slow_calls = slow_calls.clone();
-                move |cmd: &[u8], port| {
-                    respond_startup(name, cmd)?;
-
-                    if contains_slice(cmd, b"slow") {
-                        return if slow_calls.fetch_add(1, Ordering::SeqCst) < 2 {
-                            Err(parse_redis_value(b"-TRYAGAIN wait for it\r\n"))
-                        } else {
-                            Err(Ok(redis_value!("slow-ok")))
-                        };
-                    }
-                    match port {
-                        6379 => Err(parse_redis_value(
-                            format!("-MOVED {X_TAG_SLOT} {name}:6380\r\n").as_bytes(),
-                        )),
-                        6380 => Err(parse_redis_value(
-                            format!("-MOVED {X_TAG_SLOT} {name}:6381\r\n").as_bytes(),
-                        )),
-                        6381 => Err(Ok(redis_value!("fast-ok"))),
-                        _ => panic!("Wrong node: {port}"),
-                    }
-                }
-            },
-        );
-
-        let value = cluster_pipe()
-            .cmd("GET")
-            .arg("{x}slow")
-            .cmd("GET")
-            .arg("{x}fast")
-            .query::<Vec<String>>(&mut connection);
-
-        assert_eq!(
-            value,
-            Ok(vec!["slow-ok".to_string(), "fast-ok".to_string()])
-        );
-        assert_eq!(slow_calls.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            take_pipeline_writes(name),
-            vec![(6379, 2), (6380, 1), (6381, 1), (6381, 1), (6381, 1),]
-        );
     }
 
     #[test]

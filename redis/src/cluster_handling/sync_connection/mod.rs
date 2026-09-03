@@ -63,7 +63,7 @@
 //! let _: redis::Value = connection.route_command(&redis::cmd("PING"), routing_info).unwrap();
 //! ```
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1663,41 +1663,15 @@ where
         let mut results = vec![Value::Nil; cmds.len()];
 
         let mut pending: Vec<PendingCmd> = (0..cmds.len()).map(PendingCmd::new).collect();
-        let mut delayed: BTreeMap<Instant, Vec<PendingCmd>> = BTreeMap::new();
+        let mut retries = 0;
 
         loop {
-            // Promote delayed commands whose backoff has elapsed. Commands that
-            // are ready never wait for ones that are backing off: a WaitAndRetry
-            // (e.g. TRYAGAIN or LOADING) sleeps on its own clock while redirects
-            // and reconnects in the same batch retry immediately.
-            let now = Instant::now();
-            while delayed
-                .first_key_value()
-                .is_some_and(|(wake_at, _)| *wake_at <= now)
-            {
-                let Some((_, ready)) = delayed.pop_first() else {
-                    break;
-                };
-                pending.extend(ready);
-            }
-
-            if pending.is_empty() {
-                let Some((&next_wake, _)) = delayed.first_key_value() else {
-                    return Ok(results);
-                };
-                thread::sleep(next_wake.saturating_duration_since(Instant::now()));
-                continue;
-            }
-
             let node_cmds = self.map_cmds_to_nodes(cmds, &pending)?;
             let (sent, failed) = self.send_all_commands(&node_cmds);
             let failed = self.recv_all_commands(&mut results, &node_cmds, &sent, failed);
 
             if failed.is_empty() {
-                // This round is done; anything still backing off gets its turn
-                // at the top of the loop.
-                pending = Vec::new();
-                continue;
+                return Ok(results);
             }
 
             if !*self.auto_reconnect.borrow()
@@ -1734,39 +1708,15 @@ where
                     let routing = RoutingInfo::for_routable(cmd);
                     results[retry_idx] = self.request(Input::Cmd(cmd), routing)?.into();
                 }
-                pending = Vec::new();
-                continue;
+                return Ok(results);
             }
 
-            let retry_limit = self.cluster_params.retry_params.number_of_retries;
-            if failed
-                .iter()
-                .any(|failure| failure.pending.retries >= retry_limit)
-            {
-                return Err(self.give_up_pipeline(failed, retry_limit));
+            if retries == self.cluster_params.retry_params.number_of_retries {
+                return Err(self.give_up_pipeline(failed));
             }
+            retries += 1;
 
-            let PipelineRetryPlan {
-                ready,
-                delayed: newly_delayed,
-                unreachable_redirect_targets,
-            } = self.plan_pipeline_retry(failed)?;
-            pending = ready;
-            for delayed_cmd in newly_delayed {
-                delayed
-                    .entry(delayed_cmd.wake_at)
-                    .or_default()
-                    .push(delayed_cmd.pending);
-            }
-
-            // This loop owns every command that can run again, including ones
-            // delayed by an earlier response batch, so recovery invalidations
-            // must be applied here rather than only to the new retry plan.
-            if !unreachable_redirect_targets.is_empty() {
-                for cmd in pending.iter_mut().chain(delayed.values_mut().flatten()) {
-                    cmd.unpin_if_target_in(&unreachable_redirect_targets);
-                }
-            }
+            pending = self.plan_pipeline_retry(failed, retries)?;
         }
     }
 
@@ -1783,7 +1733,7 @@ where
     /// terminal failure if there is one, else the earliest command's — rather
     /// than whichever node happened to iterate first out of a HashMap, where a
     /// retryable MOVED could mask a NoRetry error.
-    fn give_up_pipeline(&self, failed: Vec<PipelineCmdFailure>, retry_limit: u32) -> RedisError {
+    fn give_up_pipeline(&self, failed: Vec<PipelineCmdFailure>) -> RedisError {
         let mut moved_hints = HashMap::new();
         let mut conflicting_moved_slots = HashSet::new();
         for failure in &failed {
@@ -1806,7 +1756,6 @@ where
             .min_by_key(|failure| {
                 (
                     !matches!(failure.error.retry_method(), RetryMethod::NoRetry),
-                    failure.pending.retries < retry_limit,
                     failure.pending.idx,
                 )
             })
@@ -1844,23 +1793,25 @@ where
     /// the recovery that each error calls for.
     ///
     /// This mirrors the per-`RetryMethod` handling in [`Self::request_inner`], but
-    /// resolves a whole batch at once so connection and slot-map recovery happen
-    /// at most once per response batch.
+    /// resolves a whole batch at once: the slot map is refreshed at most once and
+    /// a `WaitAndRetry` backoff is slept at most once per round, no matter how
+    /// many commands in the pipeline asked for it. That single shared sleep also
+    /// paces the round itself: while a reshard keeps some commands backing off,
+    /// recovery and refresh work cannot repeat faster than the backoff cadence.
     fn plan_pipeline_retry(
         &self,
         failed: Vec<PipelineCmdFailure>,
-    ) -> RedisResult<PipelineRetryPlan> {
-        let mut ready = Vec::with_capacity(failed.len());
-        let mut delayed = Vec::new();
+        retries: u32,
+    ) -> RedisResult<Vec<PendingCmd>> {
+        let mut pending = Vec::with_capacity(failed.len());
         let mut refresh_now = false;
         let mut refresh_rate_limited = false;
+        let mut sleep_time = Duration::ZERO;
         let mut reconnect = HashSet::new();
         let mut reconnect_from_initial = HashSet::new();
         let mut terminal_error = None;
         let mut moved_hints = HashMap::new();
         let mut conflicting_moved_slots = HashSet::new();
-        let retry_now = Instant::now();
-        let mut wait_deadlines = HashMap::new();
 
         for failure in failed {
             let PipelineCmdFailure {
@@ -1868,9 +1819,6 @@ where
                 addr,
                 error: err,
             } = failure;
-            // Retry budgets and backoff schedules belong to commands, not send
-            // rounds: ready commands can advance while others remain delayed.
-            failed_cmd.retries += 1;
             match err.retry_method() {
                 RetryMethod::AskRedirect => {
                     // Unlike MOVED, an ASK slot is still owned by the node that
@@ -1882,7 +1830,7 @@ where
                         .map(Redirect::Ask);
                     refresh_now |= redirect.is_none();
                     failed_cmd.redirect = redirect;
-                    ready.push(failed_cmd);
+                    pending.push(failed_cmd);
                 }
                 RetryMethod::MovedRedirect => {
                     let moved_to = err.redirect_node().and_then(|(node, slot)| {
@@ -1906,7 +1854,7 @@ where
                             }
                             refresh_rate_limited = true;
                             failed_cmd.redirect = Some(Redirect::Moved(addr));
-                            ready.push(failed_cmd);
+                            pending.push(failed_cmd);
                         }
                         None => {
                             // A redirect we cannot parse teaches us nothing and
@@ -1914,35 +1862,30 @@ where
                             // refresh is the only way to make progress.
                             refresh_now = true;
                             failed_cmd.redirect = None;
-                            ready.push(failed_cmd);
+                            pending.push(failed_cmd);
                         }
                     }
                 }
                 RetryMethod::WaitAndRetry => {
-                    // Commands that fail together at the same retry count share
-                    // one jittered deadline, so they wake as a pipeline instead
-                    // of fragmenting into independently timed requests.
-                    let wake_at = *wait_deadlines.entry(failed_cmd.retries).or_insert_with(|| {
-                        retry_now
-                            + self
-                                .cluster_params
-                                .retry_params
-                                .wait_time_for_retry(failed_cmd.retries)
-                    });
-                    delayed.push(DelayedCmd {
-                        wake_at,
-                        pending: failed_cmd,
-                    });
+                    // One shared sleep per round: every command that asked to
+                    // wait (and everything retried alongside it) advances
+                    // together after the longest requested backoff.
+                    let wait = self
+                        .cluster_params
+                        .retry_params
+                        .wait_time_for_retry(retries);
+                    sleep_time = sleep_time.max(wait);
+                    pending.push(failed_cmd);
                 }
                 RetryMethod::Reconnect => {
                     reconnect.insert(addr);
-                    ready.push(failed_cmd);
+                    pending.push(failed_cmd);
                 }
                 RetryMethod::ReconnectFromInitialConnections => {
                     reconnect_from_initial.insert(addr);
-                    ready.push(failed_cmd);
+                    pending.push(failed_cmd);
                 }
-                RetryMethod::RetryImmediately => ready.push(failed_cmd),
+                RetryMethod::RetryImmediately => pending.push(failed_cmd),
                 RetryMethod::NoRetry => {
                     terminal_error = terminal_error.or(Some(err));
                 }
@@ -1953,8 +1896,15 @@ where
         let unreachable_redirect_targets =
             self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
         if !unreachable_redirect_targets.is_empty() {
-            // The scheduler unpins every queued command targeting these nodes.
-            // Refresh immediately so routing through the slot map can recover.
+            // A redirect pinned to a node we cannot reach would stick for the
+            // whole retry budget, overriding whatever the slot map learns in the
+            // meantime. Unpin those commands so the map routes them, and ask for
+            // an immediate refresh so it has a chance to know better. Unlike a
+            // usable MOVED redirect, unpinning has no recovery path while the
+            // slot map still names the unreachable node.
+            for cmd in &mut pending {
+                cmd.unpin_if_target_in(&unreachable_redirect_targets);
+            }
             refresh_now = true;
         }
 
@@ -1975,12 +1925,11 @@ where
             // redirects — must not fail the whole pipeline.
             let _ = self.refresh_slots_rate_limited();
         }
+        if !sleep_time.is_zero() {
+            thread::sleep(sleep_time);
+        }
 
-        Ok(PipelineRetryPlan {
-            ready,
-            delayed,
-            unreachable_redirect_targets,
-        })
+        Ok(pending)
     }
 
     /// Repair connections that failed during one pipeline attempt.
@@ -2290,8 +2239,6 @@ struct PendingCmd {
     /// Where the previous attempt's error said to send this command. Overrides
     /// the slot map, for this attempt only.
     redirect: Option<Redirect>,
-    /// Number of retries already scheduled for this command.
-    retries: u32,
 }
 
 impl PendingCmd {
@@ -2300,7 +2247,6 @@ impl PendingCmd {
         PendingCmd {
             idx,
             redirect: None,
-            retries: 0,
         }
     }
 
@@ -2313,23 +2259,6 @@ impl PendingCmd {
             self.redirect = None;
         }
     }
-}
-
-/// A command whose retry is backing off (`WaitAndRetry`, e.g. TRYAGAIN or
-/// LOADING). It rejoins the pending set once `wake_at` passes; until then the
-/// rest of the batch retries without it.
-#[derive(Debug)]
-struct DelayedCmd {
-    wake_at: Instant,
-    pending: PendingCmd,
-}
-
-/// One retry round's output, including recovery effects that the scheduler must
-/// apply to commands retained from earlier rounds.
-struct PipelineRetryPlan {
-    ready: Vec<PendingCmd>,
-    delayed: Vec<DelayedCmd>,
-    unreachable_redirect_targets: HashSet<NodeAddress>,
 }
 
 #[derive(Debug)]
