@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arcstr::ArcStr;
 
@@ -94,6 +94,48 @@ impl SlotMap {
         }
         self.slots
             .insert(slot, slot, SlotAddrs::new(primary, replicas));
+    }
+
+    /// Apply a batch of MOVED hints with one replica lookup and slot-range pass.
+    ///
+    /// Replica carry-over is resolved against a snapshot of the map as it stood
+    /// *before* the batch, so this is deliberately not always equivalent to
+    /// applying the same hints one by one through [`Self::update_slot`], which
+    /// re-scans after every hint. The cases diverge only when one batch both
+    /// evacuates a primary's last range and assigns another slot to that primary:
+    /// the snapshot still knows the replica set, sequential application would
+    /// not. Both outcomes route correctly (an empty replica set falls back to
+    /// the primary); the snapshot is preferred because the hints all describe
+    /// the same instant of cluster topology, not a sequence of states.
+    pub(crate) fn update_slots(&mut self, updates: impl IntoIterator<Item = (u16, NodeAddress)>) {
+        // Sorting also deduplicates repeated hints for the same slot. Conflicting
+        // hints are resolved by the caller before they reach this method.
+        let updates: BTreeMap<_, _> = updates.into_iter().collect();
+        if updates.is_empty() {
+            return;
+        }
+
+        let replicas_by_primary = {
+            let updated_primaries: HashSet<_> = updates.values().collect();
+            self.slots
+                .values()
+                .filter(|addrs| updated_primaries.contains(&addrs.primary))
+                .map(|addrs| (addrs.primary.clone(), addrs.replicas.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+
+        self.slots.replace_points(
+            updates
+                .into_iter()
+                .map(|(slot, primary)| {
+                    let replicas = replicas_by_primary
+                        .get(&primary)
+                        .cloned()
+                        .unwrap_or_default();
+                    (slot, SlotAddrs::new(primary, replicas))
+                })
+                .collect(),
+        );
     }
 
     pub fn slot_addr_for_route(
@@ -204,7 +246,7 @@ impl SlotMap {
 /// which stores only the master and optional replica
 /// to avoid the need to choose a replica each time
 /// a command is executed
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SlotAddrs {
     primary: NodeAddress,
     replicas: Vec<NodeAddress>,
@@ -416,6 +458,88 @@ mod tests {
         // No replica set is knowable for a node that owns nothing else yet;
         // reads must degrade to the primary rather than to a stale replica.
         assert_eq!(replica_for(&map, 1500).as_deref(), Some("new:6379"));
+    }
+
+    #[test]
+    fn update_slots_coalesces_adjacent_ranges_with_the_same_owner() {
+        let mut map = three_shards();
+        map.update_slots([
+            (1997, addr("n3:6379")),
+            (1998, addr("n3:6379")),
+            (1999, addr("n3:6379")),
+        ]);
+
+        let ranges = map
+            .slots
+            .iter()
+            .map(|(start, end, addrs)| (start, end, addrs.primary.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            vec![
+                (0, 999, "n1:6379".to_string()),
+                (1000, 1996, "n2:6379".to_string()),
+                (1997, 2999, "n3:6379".to_string()),
+            ]
+        );
+        assert_eq!(replica_for(&map, 1997).as_deref(), Some("r3:6379"));
+    }
+
+    #[test]
+    fn update_slots_carries_replicas_from_the_pre_batch_map() {
+        // One batch both evacuates n1's last range and hands it slot 1500. The
+        // replica set comes from the pre-batch snapshot, so n1's replica is
+        // carried over; sequential `update_slot` application (evacuation first)
+        // would have found no n1 range and pinned reads to the primary. This
+        // pins the intended snapshot semantics.
+        let mut map = three_shards();
+        let mut updates: Vec<_> = (0..1000).map(|slot| (slot, addr("n3:6379"))).collect();
+        updates.push((1500, addr("n1:6379")));
+        map.update_slots(updates);
+
+        assert_eq!(primary_for(&map, 1500).as_deref(), Some("n1:6379"));
+        assert_eq!(replica_for(&map, 1500).as_deref(), Some("r1:6379"));
+        for slot in [0, 500, 999] {
+            assert_eq!(primary_for(&map, slot).as_deref(), Some("n3:6379"));
+        }
+    }
+
+    #[test]
+    fn update_slots_matches_sequential_updates() {
+        // The generated hints never evacuate a primary's last range, so this
+        // stays inside the regime where batch and sequential application agree.
+        // The case where they deliberately diverge is pinned by
+        // `update_slots_carries_replicas_from_the_pre_batch_map`.
+        let mut updates = Vec::new();
+        let mut state: u64 = 7;
+        for i in 0..1000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let slot = ((state >> 33) % 3000) as u16;
+            let owner = if i % 3 == 0 { "n1:6379" } else { "nX:6379" };
+            updates.push((slot, addr(owner)));
+        }
+
+        let mut sequential = three_shards();
+        for (slot, owner) in &updates {
+            sequential.update_slot(*slot, owner.clone());
+        }
+        let mut batched = three_shards();
+        batched.update_slots(updates);
+
+        for slot in 0..3000 {
+            assert_eq!(
+                primary_for(&batched, slot),
+                primary_for(&sequential, slot),
+                "slot {slot} has a different primary"
+            );
+            assert_eq!(
+                replica_for(&batched, slot),
+                replica_for(&sequential, slot),
+                "slot {slot} has a different replica"
+            );
+        }
     }
 
     #[test]

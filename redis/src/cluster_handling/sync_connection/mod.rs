@@ -95,6 +95,7 @@ use crate::cluster_routing::{
     MultipleNodeRoutingInfo, ResponsePolicy, Routable, SingleNodeRoutingInfo, Slot, SlotAddr,
 };
 use crate::cmd::{Cmd, cmd};
+use crate::commands::is_readonly_cmd;
 use crate::connection::{Connection, ConnectionInfo, ConnectionLike, connect};
 use crate::errors::{ErrorKind, RedisError, RetryMethod};
 use crate::parser::parse_redis_value;
@@ -209,6 +210,18 @@ pub trait Connect: Sized {
     /// Fetches a single response from the connection.  This is useful
     /// if used in combination with `send_packed_command`.
     fn recv_response(&mut self) -> RedisResult<Value>;
+
+    /// Discards the next `count` in-flight responses instead of handing them to
+    /// future readers, realigning a connection whose reader abandoned them
+    /// (e.g. a pipeline drain that stopped at a read timeout).
+    ///
+    /// Returns whether the connection supports this. `false` — the default —
+    /// means the caller must not reuse the connection and should discard it,
+    /// because unaccounted frames would be served as answers to the wrong
+    /// commands.
+    fn abandon_responses(&mut self, _count: usize) -> bool {
+        false
+    }
 }
 
 impl Connect for Connection {
@@ -233,6 +246,11 @@ impl Connect for Connection {
 
     fn recv_response(&mut self) -> RedisResult<Value> {
         Self::recv_response(self)
+    }
+
+    fn abandon_responses(&mut self, count: usize) -> bool {
+        self.abandon_replies(count);
+        true
     }
 }
 
@@ -538,7 +556,8 @@ where
     /// Refreshes the whole slot map, unless one was refreshed recently.
     ///
     /// Only for callers that have another way to reach the right node — a MOVED
-    /// whose hint has already been recorded by [`SlotMap::update_slot`], or a
+    /// whose hint has already been recorded by [`SlotMap::update_slot`] or
+    /// [`SlotMap::update_slots`], or a
     /// retry that will follow its own redirect. For those, refetching all 16384
     /// mappings is not what makes the request correct; it only refreshes replica
     /// sets, picks up nodes joining or leaving, and compacts a map that
@@ -1121,41 +1140,70 @@ where
     fn get_addr_for_cmd(&self, cmd: &Cmd) -> RedisResult<NodeAddress> {
         let slots = self.slots.borrow();
 
-        let addr_for_slot = |route: Route| -> RedisResult<NodeAddress> {
-            let slot_addr = slots
+        let addr_for_slot = |route: Route| -> Option<NodeAddress> {
+            slots
                 .slot_addr_for_route(&route, self.routing_strategy.as_deref())
-                .ok_or((ErrorKind::Client, "Missing slot coverage"))?;
-            Ok(slot_addr.clone())
+                .cloned()
         };
 
-        match RoutingInfo::for_routable(cmd) {
-            Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)) => Ok(addr_for_slot(
-                Route::with_slot(Slot::new_random(), SlotAddr::Master),
-            )?),
+        let addr = match RoutingInfo::for_routable(cmd) {
+            Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random)) => {
+                addr_for_slot(Route::with_slot(Slot::new_random(), SlotAddr::Master))
+            }
             Some(RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(route))) => {
-                Ok(addr_for_slot(route)?)
+                addr_for_slot(route)
             }
             _ => fail!(UNROUTABLE_ERROR),
+        };
+        if let Some(addr) = addr {
+            return Ok(addr);
         }
+        // The slot map has a gap (e.g. a refresh raced a reshard). Try a random
+        // connected node, the same fallback the single-command path uses: slots
+        // are involved, so a wrong node rejects the command with a MOVED that
+        // teaches the next round the real owner.
+        self.connections
+            .borrow()
+            .keys()
+            .choose(&mut rng())
+            .cloned()
+            .ok_or_else(|| {
+                RedisError::from((ErrorKind::ClusterConnectionNotFound, "No connections found"))
+            })
     }
 
-    fn map_cmds_to_nodes(&self, cmds: &[Cmd]) -> RedisResult<Vec<NodeCmd>> {
+    /// Group the `pending` commands into one pipeline per node.
+    ///
+    /// A pending command carries the redirect, if any, that the previous attempt
+    /// told us to follow. That redirect wins over the slot map, and an `ASK`
+    /// redirect also gets an `ASKING` written into the pipe immediately before
+    /// the command it applies to.
+    fn map_cmds_to_nodes(&self, cmds: &[Cmd], pending: &[PendingCmd]) -> RedisResult<Vec<NodeCmd>> {
         let mut cmd_map: HashMap<NodeAddress, NodeCmd> = HashMap::new();
 
-        for (idx, cmd) in cmds.iter().enumerate() {
-            let addr = self.get_addr_for_cmd(cmd)?;
+        for pending_cmd in pending {
+            let cmd = &cmds[pending_cmd.idx];
+            let (addr, is_asking) = match &pending_cmd.redirect {
+                Some(Redirect::Moved(addr)) => (addr.clone(), false),
+                Some(Redirect::Ask(addr)) => (addr.clone(), true),
+                None => (self.get_addr_for_cmd(cmd)?, false),
+            };
             let nc = cmd_map
                 .entry(addr.clone())
                 .or_insert_with(|| NodeCmd::new(addr));
-            nc.indexes.push(idx);
+            if is_asking {
+                // `ASKING` only covers the command that immediately follows it, so
+                // it is written once per redirected command rather than once per
+                // pipe, and it adds a response that nothing is waiting for.
+                nc.pipe.extend_from_slice(ASKING);
+                nc.responses.push(NodeResponse::Asking);
+            }
+            nc.responses
+                .push(NodeResponse::Command(pending_cmd.clone()));
             cmd.write_packed_command(&mut nc.pipe);
         }
 
-        let mut result = Vec::new();
-        for (_, v) in cmd_map.drain() {
-            result.push(v);
-        }
-        Ok(result)
+        Ok(cmd_map.into_values().collect())
     }
 
     fn execute_on_all(
@@ -1425,9 +1473,22 @@ where
 
         let mut retries = 0;
         let mut redirected = None::<Redirect>;
+        let mut pending_moved_hint = None::<(u16, NodeAddress)>;
         let mut excluded_read_nodes = Vec::new();
 
         loop {
+            if let Some((slot, addr)) = pending_moved_hint.take() {
+                // A MOVED target may already have left the cluster or be unreachable
+                // from this client. Publishing it before connecting would poison the
+                // shared slot map for later requests.
+                {
+                    let mut connections = self.connections.borrow_mut();
+                    self.get_connection_by_addr(&mut connections, &addr)?;
+                }
+                self.slots.borrow_mut().update_slot(slot, addr);
+                self.refresh_slots_rate_limited()?;
+            }
+
             // Get target address and response.
             let (addr, rv) = {
                 let mut connections = self.connections.borrow_mut();
@@ -1442,7 +1503,7 @@ where
                         // ASKING command into the connection before what we
                         // actually want to execute.
                         conn = conn.and_then(|conn| {
-                            conn.req_packed_command(&b"*1\r\n$6\r\nASKING\r\n"[..])
+                            conn.req_packed_command(ASKING)
                                 .and_then(|value| value.extract_error())?;
                             Ok(conn)
                         });
@@ -1516,20 +1577,11 @@ where
                             });
                             match moved_to {
                                 Some((addr, slot)) => {
-                                    // A MOVED is authoritative about one slot's new
-                                    // owner, so record it instead of discarding it and
-                                    // asking the cluster to describe all 16384 slots
-                                    // again. This arm is MOVED-only: the ASK arm below
-                                    // must never do this, because an ASK slot is still
-                                    // owned by the node that issued the redirect.
-                                    //
-                                    // The borrow is scoped to this statement so it ends
-                                    // before the refresh borrows `slots` again.
-                                    self.slots.borrow_mut().update_slot(slot, addr.clone());
-                                    // Having learned the mapping first-hand, the full
-                                    // refresh is now only about replica and node-set
-                                    // freshness, so it is safe to rate limit.
-                                    self.refresh_slots_rate_limited()?;
+                                    // A reachable MOVED is authoritative about one
+                                    // slot's new owner. Connect before publishing the
+                                    // hint so an unreachable target cannot poison the
+                                    // shared map for later requests.
+                                    pending_moved_hint = Some((slot, addr.clone()));
                                     redirected = Some(Redirect::Moved(addr));
                                 }
                                 None => {
@@ -1598,80 +1650,488 @@ where
         }
     }
 
+    /// Run every command in `cmds` and collect the responses in the caller's order.
+    ///
+    /// The commands are grouped into one pipeline per node and sent as a batch.
+    /// Whatever comes back asking to be retried is regrouped and re-sent as a
+    /// *new pipeline*, so a reshard that displaces `N` commands costs one extra
+    /// round trip per node rather than `N` sequential single-command requests.
     fn send_recv_and_retry_cmds(&self, cmds: &[Cmd]) -> RedisResult<Vec<Value>> {
         // Vector to hold the results, pre-populated with `Nil` values. This allows the original
         // cmd ordering to be re-established by inserting the response directly into the result
         // vector (e.g., results[10] = response).
         let mut results = vec![Value::Nil; cmds.len()];
 
-        let to_retry = self
-            .send_all_commands(cmds)
-            .and_then(|node_cmds| self.recv_all_commands(&mut results, &node_cmds))?;
+        let mut pending: Vec<PendingCmd> = (0..cmds.len()).map(PendingCmd::new).collect();
+        let mut retries = 0;
 
-        if to_retry.is_empty() {
-            return Ok(results);
+        loop {
+            let node_cmds = self.map_cmds_to_nodes(cmds, &pending)?;
+            let (sent, failed) = self.send_all_commands(&node_cmds);
+            let failed = self.recv_all_commands(&mut results, &node_cmds, &sent, failed);
+
+            if failed.is_empty() {
+                return Ok(results);
+            }
+
+            if !*self.auto_reconnect.borrow()
+                && let Some(failure) = failed
+                    .iter()
+                    .find(|failure| !matches!(failure.error.kind(), ErrorKind::Server(_)))
+            {
+                // Retrying a transport failure may require replacing a connection;
+                // preserve the caller's opt-out instead of reconnecting indirectly.
+                return Err(failure.error.clone());
+            }
+
+            // Regrouping read-only commands cannot change their effects. If any
+            // failed command may mutate state, preserve the legacy path for the
+            // whole failed set so retries retain their original ordering.
+            if !failed
+                .iter()
+                .all(|failure| Self::is_safe_to_retry_in_pipeline(&cmds[failure.pending.idx]))
+            {
+                let mut single_retries = failed;
+                single_retries.sort_by_key(|failure| failure.pending.idx);
+                if let Some(failure) = single_retries
+                    .iter()
+                    .find(|failure| !matches!(failure.error.kind(), ErrorKind::Server(_)))
+                {
+                    // Before pipeline retries were batched, transport failures
+                    // from the initial pipeline were returned to the caller.
+                    return Err(failure.error.clone());
+                }
+                self.refresh_slots()?;
+                for failure in single_retries {
+                    let retry_idx = failure.pending.idx;
+                    let cmd = &cmds[retry_idx];
+                    let routing = RoutingInfo::for_routable(cmd);
+                    results[retry_idx] = self.request(Input::Cmd(cmd), routing)?.into();
+                }
+                return Ok(results);
+            }
+
+            if retries == self.cluster_params.retry_params.number_of_retries {
+                return Err(self.give_up_pipeline(failed));
+            }
+            retries += 1;
+
+            pending = self.plan_pipeline_retry(failed, retries)?;
         }
-
-        // Refresh the slots to give the retry attempts a clean slate. Rate limited
-        // because it is an optimisation rather than the recovery mechanism: each
-        // command below is retried through `request`, which follows its own
-        // redirects and falls back to an unthrottled refresh when it cannot.
-        self.refresh_slots_rate_limited()?;
-
-        // Given that there are commands that need to be retried, it means something in the cluster
-        // topology changed. Execute each command separately to take advantage of the existing
-        // retry logic that handles these cases.
-        for retry_idx in to_retry {
-            let cmd = &cmds[retry_idx];
-            let routing = RoutingInfo::for_routable(cmd);
-            results[retry_idx] = self.request(Input::Cmd(cmd), routing)?.into();
-        }
-        Ok(results)
     }
 
-    // Build up a pipeline per node, then send it
-    fn send_all_commands(&self, cmds: &[Cmd]) -> RedisResult<Vec<NodeCmd>> {
+    fn is_safe_to_retry_in_pipeline(cmd: &Cmd) -> bool {
+        cmd.command()
+            .is_some_and(|command| is_readonly_cmd(&command))
+    }
+
+    /// Out of attempts: record what the final round still taught us, then pick
+    /// the error to surface.
+    ///
+    /// The final round's non-conflicting MOVED hints are kept so later requests
+    /// do not have to rediscover them. The surfaced error is deterministic — a
+    /// terminal failure if there is one, else the earliest command's — rather
+    /// than whichever node happened to iterate first out of a HashMap, where a
+    /// retryable MOVED could mask a NoRetry error.
+    fn give_up_pipeline(&self, failed: Vec<PipelineCmdFailure>) -> RedisError {
+        let mut moved_hints = HashMap::new();
+        let mut conflicting_moved_slots = HashSet::new();
+        for failure in &failed {
+            if matches!(failure.error.retry_method(), RetryMethod::MovedRedirect)
+                && let Some((node, slot)) = failure.error.redirect_node()
+                && let Ok(addr) = NodeAddress::try_from(node)
+            {
+                Self::record_moved_hint(
+                    &mut moved_hints,
+                    &mut conflicting_moved_slots,
+                    slot,
+                    &addr,
+                );
+            }
+        }
+        self.slots.borrow_mut().update_slots(moved_hints);
+
+        failed
+            .into_iter()
+            .min_by_key(|failure| {
+                (
+                    !matches!(failure.error.retry_method(), RetryMethod::NoRetry),
+                    failure.pending.idx,
+                )
+            })
+            .expect("the retry loop only gives up on a non-empty failure set")
+            .error
+    }
+
+    /// Record one authoritative MOVED hint unless this response batch reports
+    /// different owners for the same slot. Returns whether this hint introduced
+    /// a conflict that requires a topology refresh while retries remain.
+    fn record_moved_hint(
+        moved_hints: &mut HashMap<u16, NodeAddress>,
+        conflicting_moved_slots: &mut HashSet<u16>,
+        slot: u16,
+        addr: &NodeAddress,
+    ) -> bool {
+        if conflicting_moved_slots.contains(&slot) {
+            return false;
+        }
+        match moved_hints.get(&slot) {
+            Some(existing) if existing != addr => {
+                moved_hints.remove(&slot);
+                conflicting_moved_slots.insert(slot);
+                true
+            }
+            Some(_) => false,
+            None => {
+                moved_hints.insert(slot, addr.clone());
+                false
+            }
+        }
+    }
+
+    /// Turn one attempt's failures into the next attempt's pending set, applying
+    /// the recovery that each error calls for.
+    ///
+    /// This mirrors the per-`RetryMethod` handling in [`Self::request_inner`], but
+    /// resolves a whole batch at once: the slot map is refreshed at most once and
+    /// a `WaitAndRetry` backoff is slept at most once per round, no matter how
+    /// many commands in the pipeline asked for it. That single shared sleep also
+    /// paces the round itself: while a reshard keeps some commands backing off,
+    /// recovery and refresh work cannot repeat faster than the backoff cadence.
+    fn plan_pipeline_retry(
+        &self,
+        failed: Vec<PipelineCmdFailure>,
+        retries: u32,
+    ) -> RedisResult<Vec<PendingCmd>> {
+        let mut pending = Vec::with_capacity(failed.len());
+        let mut refresh_now = false;
+        let mut refresh_rate_limited = false;
+        let mut sleep_time = Duration::ZERO;
+        let mut reconnect = HashSet::new();
+        let mut reconnect_from_initial = HashSet::new();
+        let mut terminal_error = None;
+        let mut moved_hints = HashMap::new();
+        let mut conflicting_moved_slots = HashSet::new();
+
+        for failure in failed {
+            let PipelineCmdFailure {
+                pending: mut failed_cmd,
+                addr,
+                error: err,
+            } = failure;
+            match err.retry_method() {
+                RetryMethod::AskRedirect => {
+                    // Unlike MOVED, an ASK slot is still owned by the node that
+                    // issued the redirect, so the slot map must not be touched
+                    // here; the redirect applies to this one attempt only.
+                    let redirect = err
+                        .redirect_node()
+                        .and_then(|(node, _slot)| NodeAddress::try_from(node).ok())
+                        .map(Redirect::Ask);
+                    refresh_now |= redirect.is_none();
+                    failed_cmd.redirect = redirect;
+                    pending.push(failed_cmd);
+                }
+                RetryMethod::MovedRedirect => {
+                    let moved_to = err.redirect_node().and_then(|(node, slot)| {
+                        NodeAddress::try_from(node).ok().map(|addr| (addr, slot))
+                    });
+                    match moved_to {
+                        Some((addr, slot)) => {
+                            // A MOVED is authoritative about one slot's new owner,
+                            // so collect it instead of discarding it and asking the
+                            // cluster to describe all 16384 slots again. Identical
+                            // hints are applied once after the whole response batch.
+                            if Self::record_moved_hint(
+                                &mut moved_hints,
+                                &mut conflicting_moved_slots,
+                                slot,
+                                &addr,
+                            ) {
+                                // Two authoritative destinations in one response
+                                // batch leave no safe map value.
+                                refresh_now = true;
+                            }
+                            refresh_rate_limited = true;
+                            failed_cmd.redirect = Some(Redirect::Moved(addr));
+                            pending.push(failed_cmd);
+                        }
+                        None => {
+                            // A redirect we cannot parse teaches us nothing and
+                            // leaves us no node to retry against, so the full
+                            // refresh is the only way to make progress.
+                            refresh_now = true;
+                            failed_cmd.redirect = None;
+                            pending.push(failed_cmd);
+                        }
+                    }
+                }
+                RetryMethod::WaitAndRetry => {
+                    // One shared sleep per round: every command that asked to
+                    // wait (and everything retried alongside it) advances
+                    // together after the longest requested backoff.
+                    let wait = self
+                        .cluster_params
+                        .retry_params
+                        .wait_time_for_retry(retries);
+                    sleep_time = sleep_time.max(wait);
+                    pending.push(failed_cmd);
+                }
+                RetryMethod::Reconnect => {
+                    reconnect.insert(addr);
+                    pending.push(failed_cmd);
+                }
+                RetryMethod::ReconnectFromInitialConnections => {
+                    reconnect_from_initial.insert(addr);
+                    pending.push(failed_cmd);
+                }
+                RetryMethod::RetryImmediately => pending.push(failed_cmd),
+                RetryMethod::NoRetry => {
+                    terminal_error = terminal_error.or(Some(err));
+                }
+            }
+        }
+
+        self.slots.borrow_mut().update_slots(moved_hints);
+        let unreachable_redirect_targets =
+            self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
+        if !unreachable_redirect_targets.is_empty() {
+            // A redirect pinned to a node we cannot reach would stick for the
+            // whole retry budget, overriding whatever the slot map learns in the
+            // meantime. Unpin those commands so the map routes them, and ask for
+            // an immediate refresh so it has a chance to know better. Unlike a
+            // usable MOVED redirect, unpinning has no recovery path while the
+            // slot map still names the unreachable node.
+            for cmd in &mut pending {
+                cmd.unpin_if_target_in(&unreachable_redirect_targets);
+            }
+            refresh_now = true;
+        }
+
+        if let Some(err) = terminal_error {
+            return Err(err);
+        }
+
+        if refresh_now {
+            // Never rate limit this one: it is the recovery mechanism, not an
+            // optimisation.
+            self.refresh_slots()?;
+        } else if refresh_rate_limited {
+            // Having learned the new mappings first-hand, the full refresh is only
+            // about replica and node-set freshness: safe to rate limit, and safe
+            // to fail. Every pending command carries its own recovery (a recorded
+            // hint, a pinned redirect, or a plain retry), so a refresh error —
+            // likely on exactly the busy, resharding cluster that triggered the
+            // redirects — must not fail the whole pipeline.
+            let _ = self.refresh_slots_rate_limited();
+        }
+        if !sleep_time.is_zero() {
+            thread::sleep(sleep_time);
+        }
+
+        Ok(pending)
+    }
+
+    /// Repair connections that failed during one pipeline attempt.
+    ///
+    /// Recovery is done once per node after every response from the attempt has
+    /// been drained. The next attempt can therefore stay scoped to its pending
+    /// commands instead of returning an I/O error to the caller and inviting a
+    /// replay of the entire original pipeline.
+    ///
+    /// Returns the addresses that were asked for and remain without a live
+    /// connection, so the caller can stop routing to them.
+    fn recover_pipeline_connections(
+        &self,
+        reconnect: &HashSet<NodeAddress>,
+        reconnect_from_initial: &HashSet<NodeAddress>,
+    ) -> HashSet<NodeAddress> {
+        if reconnect.is_empty() && reconnect_from_initial.is_empty() {
+            return HashSet::new();
+        }
+        if !*self.auto_reconnect.borrow() {
+            // Nothing gets repaired; report everything unrepaired so the caller
+            // routes around these nodes instead of re-sending into them.
+            return reconnect.union(reconnect_from_initial).cloned().collect();
+        }
+
+        let mut unrepaired = HashSet::new();
         let mut connections = self.connections.borrow_mut();
-
-        let node_cmds = self.map_cmds_to_nodes(cmds)?;
-        for nc in &node_cmds {
-            self.get_connection_by_addr(&mut connections, &nc.addr)?
-                .send_packed_command(&nc.pipe)?;
+        for addr in reconnect {
+            connections.remove(addr);
+            if let Ok(mut conn) = self.connect(addr)
+                && conn.check_connection()
+            {
+                connections.insert(addr.clone(), conn);
+            } else {
+                unrepaired.insert(addr.clone());
+            }
         }
-        Ok(node_cmds)
+        for addr in reconnect_from_initial {
+            if reconnect.contains(addr) {
+                continue;
+            }
+            if let Ok(mut conn) = self.connect(addr)
+                && conn.check_connection()
+            {
+                connections.insert(addr.clone(), conn);
+            } else {
+                unrepaired.insert(addr.clone());
+            }
+        }
+        self.notify_connections_changed(&connections);
+        unrepaired
     }
 
-    // Receive from each node, keeping track of which commands need to be retried.
+    // Send each node its pipeline, retaining failures for only that node's
+    // pending commands while allowing the other node pipelines to proceed.
+    fn send_all_commands(&self, node_cmds: &[NodeCmd]) -> (Vec<bool>, Vec<PipelineCmdFailure>) {
+        let mut connections = self.connections.borrow_mut();
+        let mut sent = vec![false; node_cmds.len()];
+        let mut failed = Vec::new();
+
+        let mut dropped_any = false;
+        for (node_idx, nc) in node_cmds.iter().enumerate() {
+            match self
+                .get_connection_by_addr(&mut connections, &nc.addr)
+                .and_then(|conn| conn.send_packed_command(&nc.pipe))
+            {
+                Ok(()) => sent[node_idx] = true,
+                Err(err) => {
+                    // A failed write may have flushed part of the pipe, and the
+                    // node will answer whatever prefix it received. Reusing the
+                    // connection would hand those responses to the next attempt's
+                    // commands, so the socket must not go back into the pool,
+                    // whatever the error's retry classification says.
+                    dropped_any |= connections.remove(&nc.addr).is_some();
+                    failed.extend(nc.failures_from(err));
+                }
+            }
+        }
+        if dropped_any {
+            self.notify_connections_changed(&connections);
+        }
+        (sent, failed)
+    }
+
+    // Receive from each node, keeping the errors that ask to be retried alongside
+    // the command they belong to.
     fn recv_all_commands(
         &self,
         results: &mut [Value],
         node_cmds: &[NodeCmd],
-    ) -> RedisResult<Vec<usize>> {
-        let mut to_retry = Vec::new();
+        sent: &[bool],
+        mut failed: Vec<PipelineCmdFailure>,
+    ) -> Vec<PipelineCmdFailure> {
         let mut connections = self.connections.borrow_mut();
-        let mut first_err = None;
+        let mut dropped_any = false;
 
-        for nc in node_cmds {
-            for cmd_idx in &nc.indexes {
-                match self
-                    .get_connection_by_addr(&mut connections, &nc.addr)?
-                    .recv_response()
+        for (node_idx, nc) in node_cmds.iter().enumerate() {
+            if !sent[node_idx] {
+                continue;
+            }
+            let conn = match self.get_connection_by_addr(&mut connections, &nc.addr) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    failed.extend(nc.failures_from(err));
+                    continue;
+                }
+            };
+            let mut asking_error = None;
+            let mut drop_conn = false;
+
+            for (response_idx, response) in nc.responses.iter().enumerate() {
+                let received = conn.recv_response();
+                if let Err(err) = &received
+                    && !err.is_cluster_error()
                 {
+                    let mut suffix_start = response_idx;
+                    if let NodeResponse::Command(pending_cmd) = response
+                        && let Some(err) = asking_error.take()
+                    {
+                        failed.push(PipelineCmdFailure::new(
+                            pending_cmd.clone(),
+                            nc.addr.clone(),
+                            err,
+                        ));
+                        // The ASKING failure above already enqueued this command;
+                        // including it in the suffix as well would run it twice
+                        // next round.
+                        suffix_start = response_idx + 1;
+                    }
+                    // Everything at and behind this position remains unresolved
+                    // and is retried. The failed read already accounted for its
+                    // own frame (`messages_to_skip`); if the socket is intact —
+                    // a timeout, not a dropped or protocol-broken connection —
+                    // account for the rest of the suffix's frames the same way
+                    // and keep the connection. Anything else cannot be realigned
+                    // by counting and must not go back into the pool.
+                    failed.extend(nc.failures_from_response(suffix_start, err.clone()));
+                    let intact = err.as_io_error().is_some() && !err.is_connection_dropped();
+                    drop_conn =
+                        !(intact && conn.abandon_responses(nc.responses.len() - response_idx - 1));
+                    break;
+                }
+
+                let pending_cmd = match response {
+                    NodeResponse::Asking => {
+                        debug_assert!(asking_error.is_none());
+                        // Server errors are represented as successful Value reads,
+                        // so extract them before draining the guarded command. The
+                        // error is assigned to that command on the next iteration.
+                        asking_error = received.and_then(Value::extract_error).err();
+                        continue;
+                    }
+                    NodeResponse::Command(pending_cmd) => pending_cmd,
+                };
+
+                if let Some(err) = asking_error.take() {
+                    // ASKING and the guarded command were already written together.
+                    // The latter response is now drained, but the preamble failure
+                    // determines the command's result just as it does on the
+                    // single-command redirect path.
+                    failed.push(PipelineCmdFailure::new(
+                        pending_cmd.clone(),
+                        nc.addr.clone(),
+                        err,
+                    ));
+                    continue;
+                }
+
+                match received {
                     // The RESP parser reports server errors as
                     // `Ok(Value::ServerError(_))` rather than `Err`.
                     // A pipelined sub-command that gets a redirect/retryable error
                     // needs to be processed in the Ok arm and retried
-                    Ok(item) if item.is_error_that_requires_action() => to_retry.push(*cmd_idx),
-                    Ok(item) => results[*cmd_idx] = item,
-                    Err(err) if err.is_cluster_error() => to_retry.push(*cmd_idx),
-                    Err(err) => first_err = first_err.or(Some(err)),
+                    Ok(Value::ServerError(err)) if err.requires_action() => {
+                        failed.push(PipelineCmdFailure::new(
+                            pending_cmd.clone(),
+                            nc.addr.clone(),
+                            err.into(),
+                        ));
+                    }
+                    Ok(item) => results[pending_cmd.idx] = item,
+                    Err(err) => failed.push(PipelineCmdFailure::new(
+                        pending_cmd.clone(),
+                        nc.addr.clone(),
+                        err,
+                    )),
                 }
             }
+            debug_assert!(asking_error.is_none());
+            if drop_conn {
+                // The socket is dead or its framing can't be trusted, so the
+                // abandoned suffix could not be accounted for. A reused
+                // connection would answer the next attempt's commands with this
+                // attempt's leftovers; drop it and let the retry reconnect
+                // lazily.
+                dropped_any |= connections.remove(&nc.addr).is_some();
+            }
         }
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(to_retry),
+        if dropped_any {
+            self.notify_connections_changed(&connections);
         }
+        failed
     }
 
     /// Send a command to the given `routing`.
@@ -1682,6 +2142,7 @@ where
 }
 
 const MULTI: &[u8] = "*1\r\n$5\r\nMULTI\r\n".as_bytes();
+const ASKING: &[u8] = "*1\r\n$6\r\nASKING\r\n".as_bytes();
 impl<C: Connect + ConnectionLike + Send> ConnectionLike for ClusterConnection<C> {
     fn supports_pipelining(&self) -> bool {
         false
@@ -1770,10 +2231,65 @@ impl<C: Connect + ConnectionLike + Send> ConnectionLike for ClusterConnection<C>
     }
 }
 
+/// A command from a cluster pipeline that is still waiting for a response.
+#[derive(Clone, Debug)]
+struct PendingCmd {
+    /// Index into the caller's command list, and into the results vector.
+    idx: usize,
+    /// Where the previous attempt's error said to send this command. Overrides
+    /// the slot map, for this attempt only.
+    redirect: Option<Redirect>,
+}
+
+impl PendingCmd {
+    /// A command with no redirect to honour, routed through the slot map.
+    fn new(idx: usize) -> PendingCmd {
+        PendingCmd {
+            idx,
+            redirect: None,
+        }
+    }
+
+    /// Stop overriding the slot map when recovery cannot reach this command's
+    /// redirect target.
+    fn unpin_if_target_in(&mut self, targets: &HashSet<NodeAddress>) {
+        if let Some(Redirect::Moved(addr) | Redirect::Ask(addr)) = &self.redirect
+            && targets.contains(addr)
+        {
+            self.redirect = None;
+        }
+    }
+}
+
+#[derive(Debug)]
+enum NodeResponse {
+    Asking,
+    Command(PendingCmd),
+}
+
+#[derive(Debug)]
+struct PipelineCmdFailure {
+    pending: PendingCmd,
+    addr: NodeAddress,
+    error: RedisError,
+}
+
+impl PipelineCmdFailure {
+    fn new(pending: PendingCmd, addr: NodeAddress, error: RedisError) -> Self {
+        Self {
+            pending,
+            addr,
+            error,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct NodeCmd {
-    // The original command indexes
-    indexes: Vec<usize>,
+    // Where each response to `pipe` goes, in wire order. A command retains its
+    // pending routing so a transport failure can retry the unresolved suffix on
+    // the same redirect target.
+    responses: Vec<NodeResponse>,
     pipe: Vec<u8>,
     addr: NodeAddress,
 }
@@ -1781,10 +2297,32 @@ struct NodeCmd {
 impl NodeCmd {
     fn new(a: NodeAddress) -> NodeCmd {
         NodeCmd {
-            indexes: vec![],
+            responses: vec![],
             pipe: vec![],
             addr: a,
         }
+    }
+
+    fn failures_from(&self, error: RedisError) -> Vec<PipelineCmdFailure> {
+        self.failures_from_response(0, error)
+    }
+
+    fn failures_from_response(
+        &self,
+        response_idx: usize,
+        error: RedisError,
+    ) -> Vec<PipelineCmdFailure> {
+        self.responses[response_idx..]
+            .iter()
+            .filter_map(|response| match response {
+                NodeResponse::Asking => None,
+                NodeResponse::Command(pending) => Some(PipelineCmdFailure::new(
+                    pending.clone(),
+                    self.addr.clone(),
+                    error.clone(),
+                )),
+            })
+            .collect()
     }
 }
 
