@@ -958,7 +958,12 @@ impl ActualConnection {
                             };
                         }
                         match (tcp, last_error) {
-                            (Some(tcp), _) => tls_connector.connect(host, tcp).unwrap(),
+                            (Some(tcp), _) => match tls_connector.connect(host, tcp) {
+                                Ok(res) => res,
+                                Err(e) => {
+                                    fail!((ErrorKind::Io, "SSL Handshake error", e.to_string()));
+                                }
+                            },
                             (None, Some(e)) => {
                                 fail!(e);
                             }
@@ -2523,6 +2528,40 @@ mod tests {
 
     use super::*;
     use util::assert_lib_name_in_connection_setup_pipeline;
+
+    /// A peer that accepts TCP and then fails the TLS handshake must surface an
+    /// error from the timeout-bounded connect path rather than panicking.
+    #[test]
+    #[cfg(all(feature = "tls-native-tls", not(feature = "tls-rustls")))]
+    fn test_native_tls_handshake_failure_with_timeout_returns_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(b"-ERR not a TLS server\r\n");
+        });
+
+        let addr = ConnectionAddr::TcpTls {
+            host: "127.0.0.1".to_string(),
+            port,
+            insecure: true,
+            tls_params: None,
+        };
+        let result =
+            ActualConnection::new(&addr, Some(Duration::from_secs(5)), &TcpSettings::default());
+        let err = match result {
+            Ok(_) => panic!("expected the TLS handshake to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::Io);
+        assert!(err.to_string().contains("SSL Handshake error"), "{err}");
+        server.join().unwrap();
+    }
 
     #[test]
     fn test_parse_redis_url() {
