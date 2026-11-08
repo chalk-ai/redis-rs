@@ -120,7 +120,7 @@ use crate::{
         get_connection_info, info_server_cmd,
         read_routing::{
             NodeAvailabilityZoneCoverage, NodeAvailabilityZoneDiscoveryCache,
-            NodeAvailabilityZoneDiscoveryMethod, NodeAvailabilityZoneDiscoveryState,
+            NodeAvailabilityZoneDiscoveryMethod, NodeAvailabilityZoneDiscoveryState, ReadOutcome,
             ReadRoutingStrategy,
         },
         routing::{
@@ -458,6 +458,7 @@ struct InnerCore<C> {
     subscription_tracker: Option<Mutex<SubscriptionTracker>>,
     routing_strategy: Option<Box<dyn ReadRoutingStrategy>>,
     read_fallback_enabled: bool,
+    tracks_node_health: bool,
     az_discovery: Arc<NodeAvailabilityZoneDiscoveryState>,
 }
 
@@ -825,6 +826,33 @@ where
 
     async fn try_request(
         self,
+        cmd: CmdArg<C>,
+        excluded_read_nodes: Vec<NodeAddress>,
+    ) -> OperationResult {
+        let strategy_read = self.tracks_node_health
+            && match &cmd {
+                CmdArg::Cmd {
+                    routing: InternalRoutingInfo::SingleNode(route),
+                    ..
+                } => is_strategy_read(route),
+                CmdArg::Cmd { .. } => false,
+                CmdArg::Pipeline { route, .. } => is_strategy_read(route),
+            };
+        let result = self.try_request_inner(cmd, excluded_read_nodes).await;
+        if strategy_read {
+            if let (OperationTarget::Node { address }, Some(strategy)) =
+                (&result.0, &self.routing_strategy)
+            {
+                if let Some(outcome) = read_outcome(&result.1) {
+                    strategy.on_read_outcome(address, outcome);
+                }
+            }
+        }
+        result
+    }
+
+    async fn try_request_inner(
+        &self,
         cmd: CmdArg<C>,
         excluded_read_nodes: Vec<NodeAddress>,
     ) -> OperationResult {
@@ -1490,6 +1518,9 @@ where
         let read_fallback_enabled = routing_strategy
             .as_deref()
             .is_some_and(ReadRoutingStrategy::supports_read_fallback);
+        let tracks_node_health = routing_strategy
+            .as_deref()
+            .is_some_and(ReadRoutingStrategy::tracks_node_health);
 
         let (pending_requests_tx, pending_requests_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(InnerCore {
@@ -1501,6 +1532,7 @@ where
             subscription_tracker,
             routing_strategy,
             read_fallback_enabled,
+            tracks_node_health,
             az_discovery: Arc::new(NodeAvailabilityZoneDiscoveryState::default()),
         });
         let core = Core(inner);
@@ -1652,6 +1684,7 @@ where
                     .try_request(request.cmd.clone(), request.excluded_read_nodes.clone());
                 self.in_flight_requests.push(Box::pin(Request {
                     retry_params: self.inner.cluster_params.retry_params.clone(),
+                    reroute_unavailable_reads: self.inner.tracks_node_health,
                     request: Some(request),
                     future: RequestState::Future {
                         future: Box::pin(future),
@@ -1667,6 +1700,7 @@ where
                 };
                 self.in_flight_requests.push(Box::pin(Request {
                     retry_params: self.inner.cluster_params.retry_params.clone(),
+                    reroute_unavailable_reads: self.inner.tracks_node_health,
                     request: Some(request),
                     future,
                 }));
@@ -1699,6 +1733,7 @@ where
                 .boxed();
             self.in_flight_requests.push(Box::pin(Request {
                 retry_params: self.inner.cluster_params.retry_params.clone(),
+                reroute_unavailable_reads: self.inner.tracks_node_health,
                 request: Some(request),
                 future: RequestState::Future { future },
             }));
@@ -1754,6 +1789,33 @@ where
                 .0,
             );
         }
+    }
+}
+
+/// Whether a request's node was picked by the read-routing strategy. Redirects
+/// name a node chosen by the server, and explicit addresses are the caller's.
+fn is_strategy_read<C>(route: &InternalSingleNodeRouting<C>) -> bool {
+    match route {
+        InternalSingleNodeRouting::SpecificNode(route)
+        | InternalSingleNodeRouting::SpecificNodeWithPreferred { route, .. } => {
+            route.slot_addr() != SlotAddr::Master
+        }
+        _ => false,
+    }
+}
+
+/// Classifies a node's reply for read-health tracking. The RESP parser
+/// delivers server errors as values, so they are checked as well; a pipeline
+/// reports its worst reply.
+fn read_outcome(result: &RedisResult<Response>) -> Option<ReadOutcome> {
+    let value_outcome = |value: &Value| match value {
+        Value::ServerError(err) => ReadOutcome::from_error(&err.clone().into()),
+        _ => Some(ReadOutcome::Responded),
+    };
+    match result {
+        Ok(Response::Single(value)) => value_outcome(value),
+        Ok(Response::Multiple(values)) => values.iter().filter_map(value_outcome).max(),
+        Err(err) => ReadOutcome::from_error(err),
     }
 }
 

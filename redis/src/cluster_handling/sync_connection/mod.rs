@@ -82,7 +82,7 @@ use super::{
     client::ClusterParams,
     read_routing::{
         NodeAvailabilityZoneCoverage, NodeAvailabilityZoneDiscoveryCache,
-        NodeAvailabilityZoneDiscoveryMethod, NodeAvailabilityZoneDiscoveryState,
+        NodeAvailabilityZoneDiscoveryMethod, NodeAvailabilityZoneDiscoveryState, ReadOutcome,
         ReadRoutingStrategy,
     },
     routing::{Redirect, Route, RoutingInfo},
@@ -351,6 +351,10 @@ pub struct ClusterConnection<C = Connection> {
     write_timeout: RefCell<Option<Duration>>,
     routing_strategy: Option<Box<dyn ReadRoutingStrategy>>,
     read_fallback_enabled: bool,
+    /// The strategy wants read outcomes reported and routes around unhealthy
+    /// nodes. Implies `read_fallback_enabled`, so a node that fails a read is
+    /// also skipped for the rest of that request.
+    tracks_node_health: bool,
     az_discovery: Arc<NodeAvailabilityZoneDiscoveryState>,
     /// Earliest instant at which a rate-limited caller may refetch the whole slot
     /// map. `None` means one is allowed now. See
@@ -403,9 +407,13 @@ where
             .read_routing_factory
             .as_ref()
             .map(|f| f.create_strategy());
-        let read_fallback_enabled = routing_strategy
+        let tracks_node_health = routing_strategy
             .as_deref()
-            .is_some_and(ReadRoutingStrategy::supports_read_fallback);
+            .is_some_and(ReadRoutingStrategy::tracks_node_health);
+        let read_fallback_enabled = tracks_node_health
+            || routing_strategy
+                .as_deref()
+                .is_some_and(ReadRoutingStrategy::supports_read_fallback);
 
         let connection = Self {
             connections: RefCell::new(HashMap::new()),
@@ -415,6 +423,7 @@ where
             write_timeout: RefCell::new(None),
             routing_strategy,
             read_fallback_enabled,
+            tracks_node_health,
             az_discovery: Arc::new(NodeAvailabilityZoneDiscoveryState::default()),
             next_slot_refresh: RefCell::new(None),
             initial_nodes: initial_nodes.to_vec(),
@@ -1102,6 +1111,71 @@ where
             )
     }
 
+    /// Reports a read's outcome to a health-tracking strategy.
+    fn report_read_outcome<T>(&self, addr: &NodeAddress, result: &RedisResult<T>) {
+        if !self.tracks_node_health || *addr == NodeAddress::default() {
+            return;
+        }
+        let Some(strategy) = &self.routing_strategy else {
+            return;
+        };
+        let outcome = match result {
+            Ok(_) => Some(ReadOutcome::Responded),
+            Err(err) => ReadOutcome::from_error(err),
+        };
+        if let Some(outcome) = outcome {
+            strategy.on_read_outcome(addr, outcome);
+        }
+    }
+
+    /// Reports one outcome per node a pipeline attempt was sent to: the worst
+    /// error that node returned, or `Responded`.
+    fn report_pipeline_outcomes(&self, node_cmds: &[NodeCmd], failed: &[PipelineCmdFailure]) {
+        if !self.tracks_node_health {
+            return;
+        }
+        let Some(strategy) = &self.routing_strategy else {
+            return;
+        };
+        for nc in node_cmds {
+            let outcome = failed
+                .iter()
+                .filter(|failure| failure.addr == nc.addr)
+                .filter_map(|failure| ReadOutcome::from_error(&failure.error))
+                .max()
+                .unwrap_or(ReadOutcome::Responded);
+            strategy.on_read_outcome(&nc.addr, outcome);
+        }
+    }
+
+    /// Skips `addr` for the rest of a read that it answered with `LOADING` or
+    /// `MASTERDOWN`, as long as another node can still serve the read. Returns
+    /// whether the read now goes elsewhere; if not, the caller keeps the
+    /// sleep-and-retry behavior rather than failing for lack of a node.
+    fn reroute_unavailable_read(
+        &self,
+        route: &Route,
+        addr: &NodeAddress,
+        excluded_nodes: &mut Vec<NodeAddress>,
+    ) -> bool {
+        if !self.uses_read_fallback(route) {
+            return false;
+        }
+        let newly_excluded = !excluded_nodes.contains(addr);
+        if newly_excluded {
+            excluded_nodes.push(addr.clone());
+        }
+        let has_alternative = self
+            .slots
+            .borrow()
+            .slot_addr_for_route_excluding(route, self.routing_strategy.as_deref(), excluded_nodes)
+            .is_some();
+        if !has_alternative && newly_excluded {
+            excluded_nodes.pop();
+        }
+        has_alternative
+    }
+
     fn note_read_node_failure(
         &self,
         routing: &SingleNodeRoutingInfo,
@@ -1489,6 +1563,18 @@ where
                 self.refresh_slots_rate_limited()?;
             }
 
+            // A redirect targets a primary named by the server, not a read
+            // chosen by the strategy, so only un-redirected attempts count
+            // toward read health.
+            let read_route = match &single_node_routing {
+                SingleNodeRoutingInfo::SpecificNode(route)
+                    if redirected.is_none() && route.slot_addr() != SlotAddr::Master =>
+                {
+                    Some(*route)
+                }
+                _ => None,
+            };
+
             // Get target address and response.
             let (addr, rv) = {
                 let mut connections = self.connections.borrow_mut();
@@ -1543,6 +1629,10 @@ where
                 (addr, conn.and_then(|conn| input.send(conn)))
             };
 
+            if read_route.is_some() {
+                self.report_read_outcome(&addr, &rv);
+            }
+
             match rv {
                 Ok(rv) => return Ok(rv),
                 Err(err) => {
@@ -1595,12 +1685,26 @@ where
                             }
                         }
                         RetryMethod::WaitAndRetry => {
-                            // Sleep and retry.
-                            let sleep_time = self
-                                .cluster_params
-                                .retry_params
-                                .wait_time_for_retry(retries);
-                            thread::sleep(sleep_time);
+                            // A replica that is loading or cut off from its
+                            // primary will not recover within a retry backoff;
+                            // send the read to another node now instead.
+                            let rerouted = READ_FALLBACK
+                                && self.tracks_node_health
+                                && ReadOutcome::is_node_unavailable(&err)
+                                && read_route.is_some_and(|route| {
+                                    self.reroute_unavailable_read(
+                                        &route,
+                                        &addr,
+                                        &mut excluded_read_nodes,
+                                    )
+                                });
+                            if !rerouted {
+                                let sleep_time = self
+                                    .cluster_params
+                                    .retry_params
+                                    .wait_time_for_retry(retries);
+                                thread::sleep(sleep_time);
+                            }
                         }
                         RetryMethod::Reconnect => {
                             if READ_FALLBACK {
@@ -1669,6 +1773,7 @@ where
             let node_cmds = self.map_cmds_to_nodes(cmds, &pending)?;
             let (sent, failed) = self.send_all_commands(&node_cmds);
             let failed = self.recv_all_commands(&mut results, &node_cmds, &sent, failed);
+            self.report_pipeline_outcomes(&node_cmds, &failed);
 
             if failed.is_empty() {
                 return Ok(results);
@@ -1716,7 +1821,7 @@ where
             }
             retries += 1;
 
-            pending = self.plan_pipeline_retry(failed, retries)?;
+            pending = self.plan_pipeline_retry(cmds, failed, retries)?;
         }
     }
 
@@ -1800,6 +1905,7 @@ where
     /// recovery and refresh work cannot repeat faster than the backoff cadence.
     fn plan_pipeline_retry(
         &self,
+        cmds: &[Cmd],
         failed: Vec<PipelineCmdFailure>,
         retries: u32,
     ) -> RedisResult<Vec<PendingCmd>> {
@@ -1867,14 +1973,25 @@ where
                     }
                 }
                 RetryMethod::WaitAndRetry => {
-                    // One shared sleep per round: every command that asked to
-                    // wait (and everything retried alongside it) advances
-                    // together after the longest requested backoff.
-                    let wait = self
-                        .cluster_params
-                        .retry_params
-                        .wait_time_for_retry(retries);
-                    sleep_time = sleep_time.max(wait);
+                    // A command whose node reported it cannot serve
+                    // (`LOADING`/`MASTERDOWN`) and that the health-tracking
+                    // strategy now routes elsewhere retries without waiting.
+                    let rerouted = self.tracks_node_health
+                        && ReadOutcome::is_node_unavailable(&err)
+                        && self
+                            .get_addr_for_cmd(&cmds[failed_cmd.idx])
+                            .is_ok_and(|next| next != addr);
+                    if !rerouted {
+                        // One shared sleep per round: every command that asked
+                        // to wait (and everything retried alongside it)
+                        // advances together after the longest requested
+                        // backoff.
+                        let wait = self
+                            .cluster_params
+                            .retry_params
+                            .wait_time_for_retry(retries);
+                        sleep_time = sleep_time.max(wait);
+                    }
                     pending.push(failed_cmd);
                 }
                 RetryMethod::Reconnect => {

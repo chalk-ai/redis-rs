@@ -9,17 +9,23 @@
 //! uniformly selected replica per shard, reducing its steady-state replica
 //! connection fan-out.
 //!
+//! `ZonalReadRoutingStrategy` also keeps a shared `ReadCircuitBreaker` that
+//! routes reads away from replicas that are loading, cut off from their
+//! primary, or not answering, until a probe read succeeds.
+//!
 //! This module contains the trait definitions for implementing custom
 //! strategies and some built-in strategies.
 //!
 //! See `examples/latency-aware-routing.rs` for a more complex custom strategy.
 
+mod circuit_breaker;
 mod interface;
 mod random_replica;
 mod round_robin_replica;
 mod uniform_random;
 mod zonal_read_routing;
 
+pub use circuit_breaker::{ReadCircuitBreaker, ReadCircuitBreakerConfig, ReadOutcome};
 pub use interface::{
     AnyNodeCandidates, ClusterTopology, NodeAvailabilityZoneCoverage,
     NodeAvailabilityZoneDiscoveryCache, NodeAvailabilityZoneDiscoveryMethod,

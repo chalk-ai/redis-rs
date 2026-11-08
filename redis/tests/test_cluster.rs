@@ -2442,6 +2442,121 @@ mod cluster {
         assert_eq!(ports.lock().unwrap().clone(), vec![6380, 6383, 6384]);
     }
 
+    /// Mock handler for the zonal circuit-breaker tests: shard 0..8192 has a
+    /// primary and its only same-zone replica (6380) in us-east-1b, and that
+    /// replica answers every GET with `LOADING`.
+    fn zonal_loading_replica_handler(
+        name: &'static str,
+        ports: Arc<std::sync::Mutex<Vec<u16>>>,
+    ) -> impl Fn(&[u8], u16) -> Result<(), redis::RedisResult<Value>> + Send + Sync + 'static {
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380, 6381],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ];
+        let zones = vec![
+            (6379, "us-east-1b"),
+            (6380, "us-east-1b"),
+            (6381, "us-east-1c"),
+            (6382, "us-east-1c"),
+            (6383, "us-east-1c"),
+            (6384, "us-east-1d"),
+        ];
+        move |cmd: &[u8], port| {
+            if is_connection_check(cmd) {
+                return Err(Ok(redis_value!(simple:"OK")));
+            }
+            if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                return respond_startup_with_replica_using_config(
+                    name,
+                    cmd,
+                    Some(slots_config.clone()),
+                );
+            }
+            if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                return Err(Ok(cluster_shards_with_zones(name, &slots_config, &zones)));
+            }
+            if contains_slice(cmd, b"GET") {
+                ports.lock().unwrap().push(port);
+                if port == 6380 {
+                    return Err(parse_redis_value(
+                        b"-LOADING Redis is loading the dataset in memory\r\n",
+                    ));
+                }
+                return Err(Ok(redis_value!("123")));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_cluster_zonal_read_circuit_breaker_routes_around_loading_replica() {
+        let name = "test_cluster_zonal_read_circuit_breaker_routes_around_loading_replica";
+        let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            zonal_loading_replica_handler(name, ports.clone()),
+        );
+
+        // The default backoff never waits less than 1.28s, so finishing well
+        // under that means the LOADING reply was re-routed, not slept on.
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let value: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+            assert_eq!(value, Some(123));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(1000));
+
+        // One LOADING reply opens the breaker; later reads skip 6380 for the
+        // other-zone replica.
+        assert_eq!(ports.lock().unwrap().clone(), vec![6380, 6381, 6381, 6381]);
+    }
+
+    #[test]
+    fn test_cluster_zonal_read_circuit_breaker_reroutes_pipeline_reads() {
+        let name = "test_cluster_zonal_read_circuit_breaker_reroutes_pipeline_reads";
+        let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            zonal_loading_replica_handler(name, ports.clone()),
+        );
+
+        let started = std::time::Instant::now();
+        let values: (Option<i32>, Option<i32>) = redis::cluster::cluster_pipe()
+            .get("test")
+            .get("{foo}test")
+            .query(&mut connection)
+            .unwrap();
+        assert_eq!(values, (Some(123), Some(123)));
+        assert!(started.elapsed() < std::time::Duration::from_millis(1000));
+
+        let mut recorded = ports.lock().unwrap().clone();
+        recorded.sort_unstable();
+        // 6380 answered LOADING once; the retry went to 6381 without a backoff.
+        assert_eq!(recorded, vec![6380, 6381, 6383]);
+    }
+
     #[test]
     fn test_cluster_zonal_read_reuses_info_server_discovery_results_after_refresh() {
         let name = "test_cluster_zonal_read_reuses_info_server_discovery_results_after_refresh";

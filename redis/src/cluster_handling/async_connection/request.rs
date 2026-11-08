@@ -13,6 +13,7 @@ use crate::{
     cluster_async::OperationTarget,
     cluster_handling::NodeAddress,
     cluster_handling::client::RetryParams,
+    cluster_handling::read_routing::ReadOutcome,
     cluster_routing::{Redirect, SlotAddr},
 };
 
@@ -217,6 +218,9 @@ impl<C> PendingRequest<C> {
 pin_project! {
     pub(super) struct Request<C> {
         pub(super) retry_params: RetryParams,
+        // The routing strategy tracks node health, so a read answered with
+        // `LOADING`/`MASTERDOWN` is re-routed at once instead of sleeping.
+        pub(super) reroute_unavailable_reads: bool,
         pub(super) request: Option<PendingRequest<C>>,
         #[pin]
         pub(super) future: RequestState<BoxFuture<'static, OperationResult>>,
@@ -225,8 +229,17 @@ pin_project! {
 
 pub(crate) fn choose_response<C>(
     result: OperationResult,
+    request: PendingRequest<C>,
+    retry_params: &RetryParams,
+) -> (Option<Retry<C>>, PollFlushAction) {
+    choose_response_with_reroute(result, request, retry_params, false)
+}
+
+pub(crate) fn choose_response_with_reroute<C>(
+    result: OperationResult,
     mut request: PendingRequest<C>,
     retry_params: &RetryParams,
+    reroute_unavailable_reads: bool,
 ) -> (Option<Retry<C>>, PollFlushAction) {
     let (target, result) = result;
     let err = match result {
@@ -334,6 +347,26 @@ pub(crate) fn choose_response<C>(
             (retry, PollFlushAction::RebuildSlots)
         }
 
+        // The health-tracking strategy has already been told this node cannot
+        // serve, so routing the read again picks another node. A node that
+        // answers the same request this way twice had no alternative; that
+        // falls through to the usual backoff.
+        (OperationTarget::Node { address }, RetryMethod::WaitAndRetry)
+            if reroute_unavailable_reads
+                && ReadOutcome::is_node_unavailable(&err)
+                && request.cmd.uses_read_fallback()
+                && !request.excluded_read_nodes.contains(&address) =>
+        {
+            (
+                retry_or_send!(|mut request: PendingRequest<C>| {
+                    request.mark_read_node_failed(&address);
+                    request.cmd.reset_routing();
+                    Retry::Immediately { request }
+                }),
+                PollFlushAction::None,
+            )
+        }
+
         (_, RetryMethod::WaitAndRetry) => (
             retry_or_send!(|request: PendingRequest<C>| {
                 Retry::AfterSleep {
@@ -396,7 +429,12 @@ impl<C> Future for Request<C> {
 
         // can unwrap, because we tested for `is_none`` earlier in the function
         let request = this.request.take().unwrap();
-        Poll::Ready(choose_response(result, request, this.retry_params))
+        Poll::Ready(choose_response_with_reroute(
+            result,
+            request,
+            this.retry_params,
+            *this.reroute_unavailable_reads,
+        ))
     }
 }
 

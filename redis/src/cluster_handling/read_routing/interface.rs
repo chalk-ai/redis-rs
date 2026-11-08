@@ -6,6 +6,7 @@ use arcstr::ArcStr;
 
 use super::super::NodeAddress;
 use super::super::slot_range_map::SlotRangeMap;
+use super::circuit_breaker::ReadOutcome;
 
 /// Availability-zone metadata discovery methods used by zonal read routing.
 #[doc(hidden)]
@@ -460,6 +461,24 @@ pub trait ReadRoutingStrategy: Send + Sync {
     fn supports_read_fallback(&self) -> bool {
         false
     }
+
+    /// Returns whether the strategy tracks per-node read health through
+    /// [`on_read_outcome`](Self::on_read_outcome) and routes around nodes
+    /// that cannot serve.
+    ///
+    /// When true, the cluster connection reports the outcome of every read
+    /// routed through the strategy, and a read that gets `LOADING` or
+    /// `MASTERDOWN` is re-routed right away instead of sleeping and retrying
+    /// the same node.
+    #[doc(hidden)]
+    fn tracks_node_health(&self) -> bool {
+        false
+    }
+
+    /// Reports how a read sent to `node` turned out. Only called when
+    /// [`tracks_node_health`](Self::tracks_node_health) returns true.
+    #[doc(hidden)]
+    fn on_read_outcome(&self, _node: &NodeAddress, _outcome: ReadOutcome) {}
 
     /// Choose which node within a shard to route a read command to.
     ///
