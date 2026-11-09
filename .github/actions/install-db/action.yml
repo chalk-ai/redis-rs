@@ -1,13 +1,11 @@
 name: "Install DB"
+description: Build and install the configured Redis or Valkey server
 inputs:
   db-org:
-    type: string,
     required: true
   db-name:
-    type: string,
     required: true
   db-version:
-    type: string,
     required: true
 
 
@@ -16,7 +14,7 @@ runs:
   steps:
     - name: Restore cached DB (and upon cache miss, mark for caching built artifacts)
       id: cache-redis
-      uses: actions/cache@v5
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         # The old variant stored the required files directly in the $HOME directory.
         # But that does not scale when also adding bundled modules. So for new cache

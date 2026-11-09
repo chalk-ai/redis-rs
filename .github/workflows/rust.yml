@@ -6,12 +6,15 @@ on:
   pull_request:
     branches: [main, 0.*.x, 1.*.x]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   REDISRS_REDIS_JSON_PATH: "/tmp/librejson.so"
 
 concurrency:
-  group: "${{ github.workflow }}-${{ github.head_ref || github.run_id || github.ref }}"
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
   cancel-in-progress: true
 
 jobs:
@@ -42,12 +45,14 @@ jobs:
           ]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Cache RedisJSON
         if: matrix.config.json-module-version != '' && matrix.config.json-module-version != 'bundled'
         id: cache-redisjson
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             /tmp/librejson.so
@@ -66,15 +71,15 @@ jobs:
           cp "$HOME/db/rejson.so" "$REDISRS_REDIS_JSON_PATH"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain/@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: nextest
 
@@ -83,8 +88,9 @@ jobs:
 
       - name: Checkout RedisJSON
         if: steps.cache-redisjson.outputs.cache-hit != 'true' && matrix.config.json-module-version != '' && matrix.config.json-module-version != 'bundled'
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          persist-credentials: false
           repository: "RedisJSON/RedisJSON"
           path: "./__ci/redis-json"
           ref: ${{ matrix.config.json-module-version }}
@@ -147,7 +153,7 @@ jobs:
       - name: Cache RedisJSON
         if: matrix.config.json-module-version != '' && matrix.config.json-module-version != 'bundled'
         id: cache-redisjson-save
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.REDISRS_REDIS_JSON_PATH }}
           key: ${{ runner.os }}-redisjson-${{ matrix.config.json-module-version }}
@@ -161,7 +167,9 @@ jobs:
       matrix: *db-matrix
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install DB
         uses: ./.github/actions/install-db
@@ -171,11 +179,11 @@ jobs:
           db-version: ${{ matrix.config.db-version }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain/@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: start-redis
         run: redis-server &
@@ -216,7 +224,9 @@ jobs:
           {toolchain: 1.85.0},
         ]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: lint
         uses: ./.github/actions/lint-and-check
         with:
@@ -241,7 +251,7 @@ jobs:
           RUSTDOCFLAGS: -Dwarnings
 
       - name: Check semver
-        uses: obi1kenobi/cargo-semver-checks-action@v2
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           package: redis
 
@@ -252,7 +262,9 @@ jobs:
     env:
       rust_ver: stable
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install DB
         uses: ./.github/actions/install-db
@@ -262,11 +274,11 @@ jobs:
           db-version: 8.0.2
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain/@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.rust_ver }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Benchmark
         run: |
@@ -278,17 +290,21 @@ jobs:
           critcmp base changes
 
       # We check out again, because we switched branches in the last step.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
   flag-frenzy:
     needs: [lint, build-and-test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain/@master
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - run: |
           cargo install --git https://github.com/nihohit/flag-frenzy.git
@@ -299,7 +315,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install OpenSSL
         shell: powershell
