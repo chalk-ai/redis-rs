@@ -1832,9 +1832,26 @@ where
                 // A MOVED target may already have left the cluster or be unreachable
                 // from this client. Publishing it before connecting would poison the
                 // shared slot map for later requests.
-                {
+                let acquired = {
                     let mut connections = self.connections.borrow_mut();
-                    self.get_connection_by_addr(&mut connections, &addr)?;
+                    self.get_connection_by_addr(&mut connections, &addr)
+                        .map(|_| ())
+                };
+                if let Err(err) = acquired {
+                    if !*self.auto_reconnect.borrow()
+                        || matches!(err.retry_method(), RetryMethod::NoRetry)
+                    {
+                        return Err(err);
+                    }
+                    // Nothing was sent to this redirect target. Drop the hint
+                    // and consult the cluster before routing the next attempt.
+                    redirected = None;
+                    self.refresh_slots_after_error();
+                    if retries == self.cluster_params.retry_params.number_of_retries {
+                        return Err(err);
+                    }
+                    retries += 1;
+                    continue;
                 }
                 self.slots.borrow_mut().update_slot(slot, addr);
                 self.slot_map_changed();
@@ -2276,6 +2293,12 @@ where
                     }
                 }
                 RetryMethod::WaitAndRetry => {
+                    if Self::is_cluster_down(&err) {
+                        // A target that cannot serve slots must not override
+                        // the owner learned by the ensuing topology refresh.
+                        failed_cmd.redirect = None;
+                        refresh_after_error = true;
+                    }
                     // A command whose node reported it cannot serve
                     // (`LOADING`/`MASTERDOWN`) and that the health-tracking
                     // strategy now routes elsewhere retries without waiting.
@@ -2288,7 +2311,6 @@ where
                         && self
                             .get_addr_for_cmd(&cmds[failed_cmd.idx])
                             .is_ok_and(|next| next != addr);
-                    refresh_after_error |= Self::is_cluster_down(&err);
                     if !rerouted {
                         // One shared sleep per round: every command that asked
                         // to wait (and everything retried alongside it)
@@ -2422,10 +2444,9 @@ where
 
         let mut dropped_any = false;
         for (node_idx, nc) in node_cmds.iter().enumerate() {
-            match self
-                .get_connection_by_addr(&mut connections, &nc.addr)
-                .and_then(|conn| conn.send_packed_command(&nc.pipe))
-            {
+            let conn = self.get_connection_by_addr(&mut connections, &nc.addr);
+            let connection_failed = conn.is_err();
+            match conn.and_then(|conn| conn.send_packed_command(&nc.pipe)) {
                 Ok(()) => sent[node_idx] = true,
                 Err(err) => {
                     // A failed write may have flushed part of the pipe, and the
@@ -2434,7 +2455,15 @@ where
                     // commands, so the socket must not go back into the pool,
                     // whatever the error's retry classification says.
                     dropped_any |= connections.remove(&nc.addr).is_some();
-                    failed.extend(nc.failures_from(err));
+                    let mut unresolved = nc.failures_from(err);
+                    if connection_failed {
+                        // The pipeline was never written, so a stale redirect
+                        // can safely yield to the refreshed slot map.
+                        for failure in &mut unresolved {
+                            failure.pending.redirect = None;
+                        }
+                    }
+                    failed.extend(unresolved);
                 }
             }
         }

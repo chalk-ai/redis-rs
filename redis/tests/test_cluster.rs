@@ -1621,7 +1621,9 @@ mod cluster {
         let _ = take_connect_attempts(name);
 
         let result = cmd("GET").arg("{x}key1").query::<String>(&mut connection);
-        assert_matches!(result, Err(err) if err.kind() == ErrorKind::Io);
+        // An unreachable redirect is discarded; recovery may retry the slot's
+        // existing owner without ever publishing the failed target.
+        assert_eq!(result, Ok("one".to_string()));
         assert_eq!(take_connect_attempts(name), vec![6380]);
 
         assert_eq!(
@@ -1629,7 +1631,7 @@ mod cluster {
             Ok("one".to_string())
         );
         assert!(take_connect_attempts(name).is_empty());
-        assert_eq!(requests_to_6379.load(Ordering::SeqCst), 2);
+        assert_eq!(requests_to_6379.load(Ordering::SeqCst), 3);
     }
 
     #[test]
