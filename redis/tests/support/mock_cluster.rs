@@ -116,6 +116,18 @@ pub fn set_connect_errors(name: &str, ports: impl IntoIterator<Item = u16>) {
         .insert(name.to_string(), ports.into_iter().collect());
 }
 
+static CONNECT_TIMEOUTS: LazyLock<RwLock<HashMap<String, HashSet<u16>>>> =
+    LazyLock::new(Default::default);
+
+/// Make sync connection establishment time out, rather than be refused.
+#[allow(dead_code)]
+pub fn set_connect_timeouts(name: &str, ports: impl IntoIterator<Item = u16>) {
+    CONNECT_TIMEOUTS
+        .write()
+        .unwrap()
+        .insert(name.to_string(), ports.into_iter().collect());
+}
+
 #[derive(Clone)]
 pub struct MockConnection {
     pub handler: Handler,
@@ -184,6 +196,14 @@ impl cluster::Connect for MockConnection {
             return Err(redis::RedisError::from(std::io::Error::from(
                 std::io::ErrorKind::ConnectionRefused,
             )));
+        }
+        if CONNECT_TIMEOUTS
+            .read()
+            .unwrap()
+            .get(name.as_str())
+            .is_some_and(|ports| ports.contains(&port))
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
         }
         CONNECTS
             .write()
@@ -498,6 +518,7 @@ impl Drop for RemoveHandler {
     fn drop(&mut self) {
         for id in &self.0 {
             HANDLERS.write().unwrap().remove(id);
+            CONNECT_TIMEOUTS.write().unwrap().remove(id);
         }
     }
 }

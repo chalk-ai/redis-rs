@@ -653,15 +653,18 @@ where
     /// `CLUSTERDOWN`. Spaced by [`ERROR_REFRESH_FLOOR`] rather than the MOVED
     /// interval, because unlike a MOVED nothing else tells the client where
     /// the slot went.
-    fn refresh_slots_after_error(&self) {
+    ///
+    /// Returns whether a refresh was attempted, including a failed attempt.
+    fn refresh_slots_after_error(&self) -> bool {
         if let Some(next) = *self.next_error_refresh.borrow() {
             if Instant::now() < next {
-                return;
+                return false;
             }
         }
         // The command that failed has its own retry and error path; a refresh
         // that fails here leaves the current map, and the next failure retries it.
         let _ = self.refresh_slots();
+        true
     }
 
     /// Refreshes the whole slot map if the periodic refresh is due.
@@ -1871,24 +1874,16 @@ where
             };
 
             // Get target address and response.
-            let (addr, rv) = {
+            let (addr, rv, connection_failed) = {
                 let mut connections = self.connections.borrow_mut();
+                let mut asking = false;
                 let (addr, conn) = if let Some(redirected) = redirected.take() {
                     let (addr, is_asking) = match redirected {
                         Redirect::Moved(addr) => (addr, false),
                         Redirect::Ask(addr) => (addr, true),
                     };
-                    let mut conn = self.get_connection_by_addr(&mut connections, &addr);
-                    if is_asking {
-                        // if we are in asking mode we want to feed a single
-                        // ASKING command into the connection before what we
-                        // actually want to execute.
-                        conn = conn.and_then(|conn| {
-                            conn.req_packed_command(ASKING)
-                                .and_then(|value| value.extract_error())?;
-                            Ok(conn)
-                        });
-                    }
+                    asking = is_asking;
+                    let conn = self.get_connection_by_addr(&mut connections, &addr);
                     (addr, conn)
                 } else {
                     match &single_node_routing {
@@ -1921,7 +1916,18 @@ where
                         }
                     }
                 };
-                (addr, conn.and_then(|conn| input.send(conn)))
+                // Preserve the failure phase: a connect timeout and a response
+                // timeout share an error kind, but only the former means that
+                // this request could not acquire a connection to its target.
+                let connection_failed = conn.is_err();
+                let rv = conn.and_then(|conn| {
+                    if asking {
+                        conn.req_packed_command(ASKING)
+                            .and_then(|value| value.extract_error())?;
+                    }
+                    input.send(conn)
+                });
+                (addr, rv, connection_failed)
             };
 
             if read_route.is_some() {
@@ -1931,6 +1937,15 @@ where
             match rv {
                 Ok(rv) => return Ok(rv),
                 Err(err) => {
+                    // Refresh only after releasing the connection/slot borrows.
+                    // In particular, TimedOut is RetryImmediately and otherwise
+                    // bypasses the failed-reconnect recovery below.
+                    if connection_failed
+                        && matches!(err.retry_method(), RetryMethod::RetryImmediately)
+                        && *self.auto_reconnect.borrow()
+                    {
+                        self.refresh_slots_after_error();
+                    }
                     if err.kind() == ErrorKind::ClusterConnectionNotFound
                         && *self.auto_reconnect.borrow()
                     {
@@ -2087,12 +2102,29 @@ where
 
         loop {
             let node_cmds = self.map_cmds_to_nodes(cmds, &pending)?;
-            let (sent, failed) = self.send_all_commands(&node_cmds);
+            let (sent, failed, refresh_after_connect_failure) = self.send_all_commands(&node_cmds);
             let failed = self.recv_all_commands(&mut results, &node_cmds, &sent, failed);
             self.report_pipeline_outcomes(&node_cmds, &failed);
 
             if failed.is_empty() {
                 return Ok(results);
+            }
+
+            let retry_as_pipeline = failed
+                .iter()
+                .all(|failure| Self::is_safe_to_retry_in_pipeline(&cmds[failure.pending.idx]));
+            // All replies have been drained. Preserve opportunistic recovery
+            // when this batch cannot retry; retryable read batches coalesce
+            // this request with the planner's other refresh requirements.
+            if refresh_after_connect_failure
+                && *self.auto_reconnect.borrow()
+                && (retries == self.cluster_params.retry_params.number_of_retries
+                    || !retry_as_pipeline
+                    || failed.iter().any(|failure| {
+                        matches!(failure.error.retry_method(), RetryMethod::NoRetry)
+                    }))
+            {
+                self.refresh_slots_after_error();
             }
 
             if !*self.auto_reconnect.borrow()
@@ -2108,10 +2140,7 @@ where
             // Regrouping read-only commands cannot change their effects. If any
             // failed command may mutate state, preserve the legacy path for the
             // whole failed set so retries retain their original ordering.
-            if !failed
-                .iter()
-                .all(|failure| Self::is_safe_to_retry_in_pipeline(&cmds[failure.pending.idx]))
-            {
+            if !retry_as_pipeline {
                 let mut single_retries = failed;
                 single_retries.sort_by_key(|failure| failure.pending.idx);
                 if let Some(failure) = single_retries
@@ -2137,7 +2166,8 @@ where
             }
             retries += 1;
 
-            pending = self.plan_pipeline_retry(cmds, failed, retries)?;
+            pending =
+                self.plan_pipeline_retry(cmds, failed, retries, refresh_after_connect_failure)?;
         }
     }
 
@@ -2227,11 +2257,13 @@ where
         cmds: &[Cmd],
         failed: Vec<PipelineCmdFailure>,
         retries: u32,
+        refresh_after_connect_failure: bool,
     ) -> RedisResult<Vec<PendingCmd>> {
         let mut pending = Vec::with_capacity(failed.len());
         let mut refresh_now = false;
         let mut refresh_rate_limited = false;
-        let mut refresh_after_error = false;
+        let mut refresh_after_error =
+            refresh_after_connect_failure && *self.auto_reconnect.borrow();
         let mut sleep_time = Duration::ZERO;
         let mut reconnect = HashSet::new();
         let mut reconnect_from_initial = HashSet::new();
@@ -2366,16 +2398,16 @@ where
             // Never rate limit this one: it is the recovery mechanism, not an
             // optimisation.
             self.refresh_slots()?;
-        } else if refresh_rate_limited {
-            // Having learned the new mappings first-hand, the full refresh is only
-            // about replica and node-set freshness: safe to rate limit, and safe
-            // to fail. Every pending command carries its own recovery (a recorded
-            // hint, a pinned redirect, or a plain retry), so a refresh error —
-            // likely on exactly the busy, resharding cluster that triggered the
-            // redirects — must not fail the whole pipeline.
-            let _ = self.refresh_slots_rate_limited();
-        } else if refresh_after_error {
-            self.refresh_slots_after_error();
+        } else {
+            // Errors use their shorter refresh floor even when this round also
+            // received MOVED. If that floor suppresses the attempt, an eligible
+            // MOVED refresh can still run. Never attempt both in one round.
+            let error_refresh_attempted = refresh_after_error && self.refresh_slots_after_error();
+            if refresh_rate_limited && !error_refresh_attempted {
+                // MOVED hints already provide recovery; this full refresh is
+                // best-effort replica/node-set discovery and may fail safely.
+                let _ = self.refresh_slots_rate_limited();
+            }
         }
         if !sleep_time.is_zero() {
             thread::sleep(sleep_time);
@@ -2437,15 +2469,24 @@ where
 
     // Send each node its pipeline, retaining failures for only that node's
     // pending commands while allowing the other node pipelines to proceed.
-    fn send_all_commands(&self, node_cmds: &[NodeCmd]) -> (Vec<bool>, Vec<PipelineCmdFailure>) {
+    fn send_all_commands(
+        &self,
+        node_cmds: &[NodeCmd],
+    ) -> (Vec<bool>, Vec<PipelineCmdFailure>, bool) {
         let mut connections = self.connections.borrow_mut();
         let mut sent = vec![false; node_cmds.len()];
         let mut failed = Vec::new();
+        let mut refresh_after_connect_failure = false;
 
         let mut dropped_any = false;
         for (node_idx, nc) in node_cmds.iter().enumerate() {
             let conn = self.get_connection_by_addr(&mut connections, &nc.addr);
             let connection_failed = conn.is_err();
+            // Reconnect-class failures already have topology recovery in the
+            // retry planner. Acquisition timeouts otherwise only retry in place.
+            refresh_after_connect_failure |= conn
+                .as_ref()
+                .is_err_and(|err| matches!(err.retry_method(), RetryMethod::RetryImmediately));
             match conn.and_then(|conn| conn.send_packed_command(&nc.pipe)) {
                 Ok(()) => sent[node_idx] = true,
                 Err(err) => {
@@ -2470,7 +2511,7 @@ where
         if dropped_any {
             self.notify_connections_changed(&connections);
         }
-        (sent, failed)
+        (sent, failed, refresh_after_connect_failure)
     }
 
     // Receive from each node, keeping the errors that ask to be retried alongside
