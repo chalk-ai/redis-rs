@@ -250,22 +250,18 @@ impl ReadCircuitBreaker {
     }
 
     fn record_failure(&self, node: &NodeAddress, outcome: ReadOutcome, now: Instant) {
-        let state = match self.node_state(node) {
-            Some(state) => state,
-            None => {
-                let mut nodes = self.inner.nodes.write().expect("Lock poisoned");
-                let state = nodes
-                    .entry(node.clone())
-                    .or_insert_with(|| {
-                        Arc::new(Mutex::new(NodeState::Closed {
-                            consecutive_failures: 0,
-                        }))
-                    })
-                    .clone();
-                self.inner.tracked.store(nodes.len(), Ordering::Relaxed);
-                state
-            }
-        };
+        // Hold the map lock through the state update so a concurrent response
+        // cannot remove the entry while this failure is being recorded.
+        let mut nodes = self.inner.nodes.write().expect("Lock poisoned");
+        let state = nodes
+            .entry(node.clone())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(NodeState::Closed {
+                    consecutive_failures: 0,
+                }))
+            })
+            .clone();
+        self.inner.tracked.store(nodes.len(), Ordering::Relaxed);
 
         let config = &self.inner.config;
         let mut state = state.lock().expect("Lock poisoned");
@@ -413,6 +409,50 @@ mod tests {
         let n = node(5);
         breaker.record(&n, ReadOutcome::Unavailable);
         assert!(!clone.is_available(&n));
+    }
+
+    fn assert_unavailable_survives_concurrent_success(pretrack_nodes: bool) {
+        let breaker = breaker();
+        let now = Instant::now();
+        let nodes: Vec<_> = (0..100_000)
+            .map(|i| NodeAddress::new(format!("replica-{i}"), 6379))
+            .collect();
+        if pretrack_nodes {
+            for node in &nodes {
+                breaker.record_at(node, ReadOutcome::Failed, now);
+            }
+        }
+
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for node in &nodes {
+                    barrier.wait();
+                    breaker.record_at(node, ReadOutcome::Unavailable, now);
+                }
+            });
+            for node in &nodes {
+                barrier.wait();
+                breaker.record_at(node, ReadOutcome::Responded, now);
+            }
+        });
+
+        // Either serial order leaves the breaker open: a success before
+        // LOADING is followed by an open, and a success after it is ignored.
+        for node in &nodes {
+            assert!(breaker.is_open(node), "lost unavailable outcome for {node}");
+        }
+        assert_eq!(breaker.inner.tracked.load(Ordering::Relaxed), nodes.len());
+    }
+
+    #[test]
+    fn concurrent_success_cannot_discard_tracked_unavailable() {
+        assert_unavailable_survives_concurrent_success(true);
+    }
+
+    #[test]
+    fn concurrent_success_cannot_discard_first_unavailable() {
+        assert_unavailable_survives_concurrent_success(false);
     }
 
     #[test]
