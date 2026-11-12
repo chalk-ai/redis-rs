@@ -1,0 +1,71 @@
+name: Cluster fault matrix
+
+# Boots real Valkey clusters and injects faults; see fault-matrix/README.md.
+# About 30 minutes, so it runs nightly and on demand rather than on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Space-separated scenario names (empty = all)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 7 * * *"
+  pull_request:
+    paths:
+      - "fault-matrix/**"
+      - ".github/workflows/fault-matrix.yml"
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.head_ref || github.run_id || github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  fault-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Valkey
+        uses: ./.github/actions/install-db
+        with:
+          db-org: valkey-io
+          db-name: valkey
+          db-version: 9.1.2
+
+      - name: Install toxiproxy
+        run: |
+          curl -fsSL -o "$HOME/toxiproxy-server" \
+            https://github.com/Shopify/toxiproxy/releases/download/v2.12.0/toxiproxy-server-linux-amd64
+          chmod +x "$HOME/toxiproxy-server"
+          echo "TOXIPROXY_SERVER=$HOME/toxiproxy-server" >> "$GITHUB_ENV"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain/@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the matrix
+        env:
+          # Through the environment, not interpolated into the script.
+          SCENARIOS: ${{ github.event.inputs.scenarios }}
+        run: |
+          read -r -a names <<< "${SCENARIOS:-}"
+          fault-matrix/run.py --out "$RUNNER_TEMP/fault-matrix" "${names[@]}"
+
+      - name: Summary
+        if: always()
+        run: cat "$RUNNER_TEMP/fault-matrix/report.md" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fault-matrix-results
+          path: ${{ runner.temp }}/fault-matrix
+          retention-days: 14

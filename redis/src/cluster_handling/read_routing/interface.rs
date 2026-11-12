@@ -6,6 +6,7 @@ use arcstr::ArcStr;
 
 use super::super::NodeAddress;
 use super::super::slot_range_map::SlotRangeMap;
+use super::circuit_breaker::ReadOutcome;
 
 /// Availability-zone metadata discovery methods used by zonal read routing.
 #[doc(hidden)]
@@ -396,6 +397,25 @@ impl<'a> ReadCandidates<'a> {
 /// }
 /// ```
 pub trait ReadRoutingStrategy: Send + Sync {
+    /// Creates an independent strategy for preparing a background topology refresh.
+    ///
+    /// Preserve per-connection configuration and affinity, such as a random seed.
+    /// The clone receives [`on_topology_changed`](Self::on_topology_changed)
+    /// before its eager connection set is queried. Those calls must not change
+    /// the live strategy's routing state or publish the uninstalled topology to
+    /// shared consumers. Health and availability-zone caches may remain shared.
+    /// The clone does not need to copy routing state that the callback rebuilds.
+    /// This method runs on the foreground thread before spawning the refresh,
+    /// so implementations should return quickly.
+    ///
+    /// The default keeps existing custom strategies compatible: background
+    /// refreshes prepare connections to all topology nodes, then the live
+    /// strategy receives its usual callbacks when the result is installed and
+    /// connections outside its eager set are dropped.
+    fn clone_for_refresh(&self) -> Option<Box<dyn ReadRoutingStrategy>> {
+        None
+    }
+
     /// Returns shared availability-zone discovery state for strategies that
     /// need per-node zone metadata.
     #[doc(hidden)]
@@ -460,6 +480,24 @@ pub trait ReadRoutingStrategy: Send + Sync {
     fn supports_read_fallback(&self) -> bool {
         false
     }
+
+    /// Returns whether the strategy tracks per-node read health through
+    /// [`on_read_outcome`](Self::on_read_outcome) and routes around nodes
+    /// that cannot serve.
+    ///
+    /// When true, the cluster connection reports the outcome of every read
+    /// routed through the strategy, and a read that gets `LOADING` or
+    /// `MASTERDOWN` is re-routed right away instead of sleeping and retrying
+    /// the same node.
+    #[doc(hidden)]
+    fn tracks_node_health(&self) -> bool {
+        false
+    }
+
+    /// Reports how a read sent to `node` turned out. Only called when
+    /// [`tracks_node_health`](Self::tracks_node_health) returns true.
+    #[doc(hidden)]
+    fn on_read_outcome(&self, _node: &NodeAddress, _outcome: ReadOutcome) {}
 
     /// Choose which node within a shard to route a read command to.
     ///

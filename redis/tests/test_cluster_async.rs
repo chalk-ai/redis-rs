@@ -1768,6 +1768,80 @@ mod cluster_async {
         assert_eq!(recorded, vec![6380, 6383, 6384]);
     }
 
+    #[test]
+    fn test_async_cluster_zonal_read_circuit_breaker_routes_around_loading_replica() {
+        let name = "test_async_cluster_zonal_read_circuit_breaker_routes_around_loading_replica";
+        let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ports_clone = ports.clone();
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380, 6381],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ];
+        let zones = vec![
+            (6379, "us-east-1b"),
+            (6380, "us-east-1b"),
+            (6381, "us-east-1c"),
+            (6382, "us-east-1c"),
+            (6383, "us-east-1c"),
+            (6384, "us-east-1d"),
+        ];
+
+        let MockEnv {
+            runtime,
+            async_connection: mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(
+                        name,
+                        cmd,
+                        Some(slots_config.clone()),
+                    );
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(name, &slots_config, &zones)));
+                }
+                if contains_slice(cmd, b"GET") {
+                    ports_clone.lock().unwrap().push(port);
+                    if port == 6380 {
+                        return Err(parse_redis_value(
+                            b"-LOADING Redis is loading the dataset in memory\r\n",
+                        ));
+                    }
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        // The default backoff never waits less than 1.28s.
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let value: Option<i32> = runtime
+                .block_on(cmd("GET").arg("test").query_async(&mut connection))
+                .unwrap();
+            assert_eq!(value, Some(123));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(1000));
+        assert_eq!(ports.lock().unwrap().clone(), vec![6380, 6381, 6381, 6381]);
+    }
+
     fn test_async_cluster_fan_out(
         name: &'static str,
         command: &'static str,

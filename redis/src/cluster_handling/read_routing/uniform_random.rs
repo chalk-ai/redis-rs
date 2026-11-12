@@ -154,6 +154,13 @@ fn choose_uniform_replica(
 }
 
 impl ReadRoutingStrategy for UniformRandom {
+    fn clone_for_refresh(&self) -> Option<Box<dyn ReadRoutingStrategy>> {
+        Some(Box::new(Self {
+            seed: self.seed,
+            slots: Arc::new(RwLock::new(SlotRangeMap::new())),
+        }))
+    }
+
     fn on_topology_changed(&self, topology: ClusterTopology) {
         let mut slots = SlotRangeMap::new();
         for shard in topology.shards() {
@@ -242,6 +249,24 @@ mod tests {
                 vec![node("replica2a", 6379), node("replica2b", 6379)],
             ),
         ])
+    }
+
+    #[test]
+    fn refresh_clone_preserves_affinity_and_isolates_routing_state() {
+        let strategy = UniformRandom::with_seed(42);
+        let topology = topology();
+        strategy.on_topology_changed(topology.clone());
+        let cloned = strategy.clone_for_refresh().unwrap();
+        assert_eq!(
+            cloned.eager_connection_nodes(&topology),
+            strategy.eager_connection_nodes(&topology)
+        );
+        let expected = strategy.selected_replica_for_slot(1).unwrap();
+        let shard = topology.shard_for_slot(1).unwrap();
+        let candidates =
+            ReadCandidates::any_node(1, shard.primary(), Replicas::new(shard.replicas()).unwrap());
+        cloned.on_topology_changed(ClusterTopology::from_shards(vec![]));
+        assert_eq!(strategy.route_read(&candidates), &expected);
     }
 
     #[test]

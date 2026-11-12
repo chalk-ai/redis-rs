@@ -107,7 +107,7 @@ impl ClusterPipeline {
     #[inline]
     pub fn query<T: FromRedisValue>(
         &self,
-        con: &mut ClusterConnection<impl ConnectionLike + Connect + Send>,
+        con: &mut ClusterConnection<impl ConnectionLike + Connect + Send + 'static>,
     ) -> RedisResult<T> {
         for cmd in &self.commands {
             let cmd_name = std::str::from_utf8(cmd.arg_idx(0).unwrap_or(b""))
@@ -138,7 +138,7 @@ impl ClusterPipeline {
     #[inline]
     pub fn exec(
         &self,
-        con: &mut ClusterConnection<impl ConnectionLike + Connect + Send>,
+        con: &mut ClusterConnection<impl ConnectionLike + Connect + Send + 'static>,
     ) -> RedisResult<()> {
         self.query::<()>(con)
     }

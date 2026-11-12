@@ -39,6 +39,10 @@ impl Default for RoundRobinReplicaStrategy {
 }
 
 impl ReadRoutingStrategy for RoundRobinReplicaStrategy {
+    fn clone_for_refresh(&self) -> Option<Box<dyn ReadRoutingStrategy>> {
+        Some(Box::new(Self::new()))
+    }
+
     fn on_topology_changed(&self, topology: ClusterTopology) {
         let mut slots = SlotRangeMap::new();
         for shard in topology.shards() {
@@ -95,6 +99,17 @@ mod tests {
             ),
         ]));
         strategy
+    }
+
+    #[test]
+    fn refresh_clone_does_not_reset_live_counters() {
+        let strategy = setup_strategy();
+        let replicas = [node("replica1a", 6379), node("replica1b", 6379)];
+        let candidates = ReadCandidates::replicas_only(1, Replicas::new(&replicas).unwrap());
+        assert_eq!(strategy.route_read(&candidates), &replicas[0]);
+        let cloned = strategy.clone_for_refresh().unwrap();
+        cloned.on_topology_changed(ClusterTopology::from_shards(vec![]));
+        assert_eq!(strategy.route_read(&candidates), &replicas[1]);
     }
 
     #[test]

@@ -1621,7 +1621,9 @@ mod cluster {
         let _ = take_connect_attempts(name);
 
         let result = cmd("GET").arg("{x}key1").query::<String>(&mut connection);
-        assert_matches!(result, Err(err) if err.kind() == ErrorKind::Io);
+        // An unreachable redirect is discarded; recovery may retry the slot's
+        // existing owner without ever publishing the failed target.
+        assert_eq!(result, Ok("one".to_string()));
         assert_eq!(take_connect_attempts(name), vec![6380]);
 
         assert_eq!(
@@ -1629,7 +1631,7 @@ mod cluster {
             Ok("one".to_string())
         );
         assert!(take_connect_attempts(name).is_empty());
-        assert_eq!(requests_to_6379.load(Ordering::SeqCst), 2);
+        assert_eq!(requests_to_6379.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -2440,6 +2442,558 @@ mod cluster {
         let _: Option<i32> = cmd("GET").arg("{foo}test").query(&mut connection).unwrap();
 
         assert_eq!(ports.lock().unwrap().clone(), vec![6380, 6383, 6384]);
+    }
+
+    /// Mock handler for the zonal circuit-breaker tests: shard 0..8192 has a
+    /// primary and its only same-zone replica (6380) in us-east-1b, and that
+    /// replica answers every GET with `LOADING`.
+    fn zonal_loading_replica_handler(
+        name: &'static str,
+        ports: Arc<std::sync::Mutex<Vec<u16>>>,
+    ) -> impl Fn(&[u8], u16) -> Result<(), redis::RedisResult<Value>> + Send + Sync + 'static {
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380, 6381],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ];
+        let zones = vec![
+            (6379, "us-east-1b"),
+            (6380, "us-east-1b"),
+            (6381, "us-east-1c"),
+            (6382, "us-east-1c"),
+            (6383, "us-east-1c"),
+            (6384, "us-east-1d"),
+        ];
+        move |cmd: &[u8], port| {
+            if is_connection_check(cmd) {
+                return Err(Ok(redis_value!(simple:"OK")));
+            }
+            if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                return respond_startup_with_replica_using_config(
+                    name,
+                    cmd,
+                    Some(slots_config.clone()),
+                );
+            }
+            if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                return Err(Ok(cluster_shards_with_zones(name, &slots_config, &zones)));
+            }
+            if contains_slice(cmd, b"GET") {
+                ports.lock().unwrap().push(port);
+                if port == 6380 {
+                    return Err(parse_redis_value(
+                        b"-LOADING Redis is loading the dataset in memory\r\n",
+                    ));
+                }
+                return Err(Ok(redis_value!("123")));
+            }
+            Ok(())
+        }
+    }
+
+    /// Two-shard topology for the refresh tests. `with_new_replica` adds 6385
+    /// (us-east-1b) to shard 1; `without_6380` drops 6380 from it.
+    fn refresh_test_slots(with_new_replica: bool, without_6380: bool) -> Vec<MockSlotRange> {
+        let mut shard1 = vec![6380, 6381];
+        if with_new_replica {
+            shard1.push(6385);
+        }
+        if without_6380 {
+            shard1.retain(|p| *p != 6380);
+        }
+        vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: shard1,
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ]
+    }
+
+    const REFRESH_TEST_ZONES: [(u16, &str); 7] = [
+        (6379, "us-east-1b"),
+        (6380, "us-east-1b"),
+        (6381, "us-east-1c"),
+        (6382, "us-east-1c"),
+        (6383, "us-east-1c"),
+        (6384, "us-east-1d"),
+        (6385, "us-east-1b"),
+    ];
+
+    #[test]
+    fn test_cluster_periodic_topology_refresh_picks_up_added_replica() {
+        let name = "test_cluster_periodic_topology_refresh_picks_up_added_replica";
+        let added = Arc::new(atomic::AtomicBool::new(false));
+        let added_clone = added.clone();
+        let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ports_clone = ports.clone();
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .periodic_topology_refresh(std::time::Duration::from_millis(100))
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                let slots = refresh_test_slots(added_clone.load(atomic::Ordering::SeqCst), false);
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(name, cmd, Some(slots));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(
+                        name,
+                        &slots,
+                        &REFRESH_TEST_ZONES,
+                    )));
+                }
+                if contains_slice(cmd, b"GET") {
+                    ports_clone.lock().unwrap().push(port);
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        for _ in 0..4 {
+            let _: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+        }
+        assert!(!ports.lock().unwrap().contains(&6385));
+
+        // The cluster gains a same-zone replica. No command fails or redirects,
+        // so only a periodic refresh can reveal it. The refresh runs in the
+        // background and a later command installs it.
+        added.store(true, atomic::Ordering::SeqCst);
+        ports.lock().unwrap().clear();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ports.lock().unwrap().contains(&6385) && std::time::Instant::now() < deadline {
+            let _: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ports.lock().unwrap().contains(&6385),
+            "{:?}",
+            ports.lock().unwrap()
+        );
+    }
+
+    fn check_background_refresh_survives_pipeline_without_moved(retries: u32) {
+        let name = if retries == 0 {
+            "background_refresh_survives_pipeline_give_up"
+        } else {
+            "background_refresh_survives_pipeline_retry"
+        };
+        let armed = Arc::new(atomic::AtomicBool::new(false));
+        let refreshes = Arc::new(atomic::AtomicUsize::new(0));
+        let requests = Arc::new(atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let started_rx = std::sync::Mutex::new(started_rx);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder([format!("redis://{name}")])
+                .periodic_topology_refresh(std::time::Duration::from_millis(20))
+                .retries(retries),
+            name,
+            {
+                let armed = armed.clone();
+                move |command, _| {
+                    if contains_slice(command, b"SLOTS") && armed.load(Ordering::SeqCst) {
+                        // Only the in-flight result reveals the replica: a
+                        // subsequent periodic refresh must not hide its loss.
+                        if refreshes.fetch_add(1, Ordering::SeqCst) != 0 {
+                            return Err(Err((ErrorKind::Client, "Refresh unavailable").into()));
+                        }
+                        started_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                        return respond_startup_with_replica_using_config(
+                            name,
+                            command,
+                            Some(vec![MockSlotRange {
+                                primary_port: 6379,
+                                replica_ports: vec![6381],
+                                slot_range: 0..16383,
+                            }]),
+                        );
+                    }
+                    respond_startup(name, command)?;
+                    if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // Keep the worker in flight until the pipeline has
+                        // planned its retry or exhausted its retry budget.
+                        started_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                        Err(Err(
+                            std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+                        ))
+                    } else {
+                        Err(Ok(Value::Int(123)))
+                    }
+                }
+            },
+        );
+        armed.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let result = cluster_pipe()
+            .get("test")
+            .query::<Vec<i64>>(&mut connection);
+        release_tx.send(()).unwrap();
+        if retries == 0 {
+            assert!(result.unwrap_err().is_timeout());
+        } else {
+            assert_eq!(result, Ok(vec![123]));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while connection.connected_node_count() == 1 && std::time::Instant::now() < deadline {
+            let _: i64 = cmd("GET").arg("test").query(&mut connection).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            connection.connected_node_count(),
+            2,
+            "in-flight replica discovery was discarded"
+        );
+    }
+
+    #[test]
+    fn test_cluster_background_refresh_survives_pipeline_failures() {
+        for retries in [0, 1] {
+            check_background_refresh_survives_pipeline_without_moved(retries);
+        }
+    }
+
+    #[test]
+    fn test_cluster_periodic_topology_refresh_does_not_block_on_a_hung_node() {
+        // Shard 2's primary stops answering for 1.5 s at a time. It is in every
+        // refresh's connection set, but reads of shard 1 never touch it, so no
+        // read may wait on it, however often the topology refreshes.
+        let name = "test_cluster_periodic_topology_refresh_does_not_block_on_a_hung_node";
+        let hung = Arc::new(atomic::AtomicBool::new(false));
+        let hung_clone = hung.clone();
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .periodic_topology_refresh(std::time::Duration::from_millis(50))
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                if port == 6382 && hung_clone.load(atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                }
+                let slots = refresh_test_slots(false, false);
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(name, cmd, Some(slots));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(
+                        name,
+                        &slots,
+                        &REFRESH_TEST_ZONES,
+                    )));
+                }
+                if contains_slice(cmd, b"GET") {
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        hung.store(true, atomic::Ordering::SeqCst);
+        let mut slowest = std::time::Duration::ZERO;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < until {
+            let started = std::time::Instant::now();
+            let value: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+            assert_eq!(value, Some(123));
+            slowest = slowest.max(started.elapsed());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        hung.store(false, atomic::Ordering::SeqCst);
+        assert!(
+            slowest < std::time::Duration::from_millis(300),
+            "a read waited {slowest:?}"
+        );
+    }
+
+    #[test]
+    fn test_cluster_topology_refresh_skips_nodes_without_slots() {
+        // Replicas answer CLUSTER SLOTS with nothing, as a node removed from the
+        // cluster by CLUSTER RESET does. Refreshes must keep using a node that
+        // describes the whole keyspace, whichever node they happen to ask first.
+        let name = "test_cluster_topology_refresh_skips_nodes_without_slots";
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(0)
+                .periodic_topology_refresh(std::time::Duration::from_millis(10))
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                let slots = refresh_test_slots(false, false);
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    if port != 6379 && port != 6382 {
+                        return Err(Ok(Value::Array(vec![])));
+                    }
+                    return respond_startup_with_replica_using_config(name, cmd, Some(slots));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(
+                        name,
+                        &slots,
+                        &REFRESH_TEST_ZONES,
+                    )));
+                }
+                if contains_slice(cmd, b"GET") {
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(12));
+            let value: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+            assert_eq!(value, Some(123));
+            let value: Option<i32> = cmd("GET").arg("{foo}test").query(&mut connection).unwrap();
+            assert_eq!(value, Some(123));
+        }
+    }
+
+    #[test]
+    fn test_cluster_clusterdown_from_removed_node_refreshes_topology() {
+        // 6380 has been removed from shard 1 and reset: it answers CLUSTERDOWN
+        // and claims no slots. The client's map still routes reads to it.
+        let name = "test_cluster_clusterdown_from_removed_node_refreshes_topology";
+        let removed = Arc::new(atomic::AtomicBool::new(false));
+        let removed_clone = removed.clone();
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(2)
+                .periodic_topology_refresh(std::time::Duration::ZERO)
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                let gone = removed_clone.load(atomic::Ordering::SeqCst);
+                let slots = refresh_test_slots(false, gone);
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    if gone && port == 6380 {
+                        return Err(Ok(Value::Array(vec![])));
+                    }
+                    return respond_startup_with_replica_using_config(name, cmd, Some(slots));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(
+                        name,
+                        &slots,
+                        &REFRESH_TEST_ZONES,
+                    )));
+                }
+                if contains_slice(cmd, b"GET") {
+                    if gone && port == 6380 {
+                        return Err(parse_redis_value(b"-CLUSTERDOWN Hash slot not served\r\n"));
+                    }
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        let value: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+        assert_eq!(value, Some(123));
+        removed.store(true, atomic::Ordering::SeqCst);
+        // Past the error-refresh floor armed by the initial refresh.
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        let value: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+        assert_eq!(value, Some(123));
+    }
+
+    #[test]
+    fn test_cluster_zonal_pipeline_ask_to_loading_target_backs_off() {
+        // The local replica answers ASK (slot mid-migration) and the ASK target
+        // answers LOADING. Only that target holds the key, so the pipeline must
+        // wait and retry it rather than spin through its retries.
+        let name = "test_cluster_zonal_pipeline_ask_to_loading_target_backs_off";
+        let target_calls = Arc::new(atomic::AtomicUsize::new(0));
+        let target_calls_clone = target_calls.clone();
+        let slots_config = vec![
+            MockSlotRange {
+                primary_port: 6379,
+                replica_ports: vec![6380, 6381],
+                slot_range: 0..8192,
+            },
+            MockSlotRange {
+                primary_port: 6382,
+                replica_ports: vec![6383, 6384],
+                slot_range: 8192..16384,
+            },
+        ];
+        let zones = vec![
+            (6379, "us-east-1b"),
+            (6380, "us-east-1b"),
+            (6381, "us-east-1c"),
+            (6382, "us-east-1c"),
+            (6383, "us-east-1c"),
+            (6384, "us-east-1d"),
+        ];
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .retries(2)
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                if is_connection_check(cmd) || contains_slice(cmd, b"ASKING") {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(
+                        name,
+                        cmd,
+                        Some(slots_config.clone()),
+                    );
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(name, &slots_config, &zones)));
+                }
+                if contains_slice(cmd, b"GET") {
+                    if port == 6380 {
+                        return Err(parse_redis_value(
+                            format!("-ASK 6918 {name}:6382\r\n").as_bytes(),
+                        ));
+                    }
+                    if port == 6382 {
+                        target_calls_clone.fetch_add(1, atomic::Ordering::SeqCst);
+                        return Err(parse_redis_value(
+                            b"-LOADING Redis is loading the dataset in memory\r\n",
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let result: redis::RedisResult<(Option<i32>,)> = redis::cluster::cluster_pipe()
+            .get("test")
+            .query(&mut connection);
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        // Two retries against a LOADING node should include at least one backoff
+        // sleep (the floor is 1.28 s), not finish in milliseconds.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1000),
+            "retries exhausted in {elapsed:?} after {} calls to the ASK target",
+            target_calls.load(atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn test_cluster_zonal_read_circuit_breaker_routes_around_loading_replica() {
+        let name = "test_cluster_zonal_read_circuit_breaker_routes_around_loading_replica";
+        let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            zonal_loading_replica_handler(name, ports.clone()),
+        );
+
+        // The default backoff never waits less than 1.28s, so finishing well
+        // under that means the LOADING reply was re-routed, not slept on.
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let value: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+            assert_eq!(value, Some(123));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(1000));
+
+        // One LOADING reply opens the breaker; later reads skip 6380 for the
+        // other-zone replica.
+        assert_eq!(ports.lock().unwrap().clone(), vec![6380, 6381, 6381, 6381]);
+    }
+
+    #[test]
+    fn test_cluster_zonal_read_circuit_breaker_reroutes_pipeline_reads() {
+        let name = "test_cluster_zonal_read_circuit_breaker_reroutes_pipeline_reads";
+        let ports = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            zonal_loading_replica_handler(name, ports.clone()),
+        );
+
+        let started = std::time::Instant::now();
+        let values: (Option<i32>, Option<i32>) = redis::cluster::cluster_pipe()
+            .get("test")
+            .get("{foo}test")
+            .query(&mut connection)
+            .unwrap();
+        assert_eq!(values, (Some(123), Some(123)));
+        assert!(started.elapsed() < std::time::Duration::from_millis(1000));
+
+        let mut recorded = ports.lock().unwrap().clone();
+        recorded.sort_unstable();
+        // 6380 answered LOADING once; the retry went to 6381 without a backoff.
+        assert_eq!(recorded, vec![6380, 6381, 6383]);
     }
 
     #[test]
