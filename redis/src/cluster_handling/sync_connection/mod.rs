@@ -692,7 +692,17 @@ where
         }
         let params = self.cluster_params.clone();
         let timeouts = (*self.read_timeout.borrow(), *self.write_timeout.borrow());
-        let fallback_cache: Arc<dyn NodeAvailabilityZoneDiscoveryCache> = self.az_discovery.clone();
+        let strategy = self.routing_strategy.as_deref();
+        let refresh_strategy = strategy.and_then(ReadRoutingStrategy::clone_for_refresh);
+        let zone_cache = refresh_strategy
+            .as_deref()
+            .or(strategy)
+            .filter(|strategy| strategy.requires_node_availability_zones())
+            .map(|strategy| {
+                strategy
+                    .node_availability_zone_discovery_cache()
+                    .unwrap_or_else(|| self.az_discovery.clone())
+            });
         let (tx, rx) = mpsc::channel();
         let spawned = thread::Builder::new()
             .name("redis-topology-refresh".to_owned())
@@ -703,7 +713,8 @@ where
                     candidates,
                     &connected,
                     timeouts,
-                    fallback_cache,
+                    refresh_strategy,
+                    zone_cache,
                 ));
             });
         if spawned.is_ok() {
@@ -2760,7 +2771,8 @@ fn prepare_topology<C: ConnectionLike + Connect + Send>(
     candidates: Vec<NodeAddress>,
     connected: &HashSet<NodeAddress>,
     (read_timeout, write_timeout): (Option<Duration>, Option<Duration>),
-    fallback_cache: Arc<dyn NodeAvailabilityZoneDiscoveryCache>,
+    strategy: Option<Box<dyn ReadRoutingStrategy>>,
+    zone_cache: Option<Arc<dyn NodeAvailabilityZoneDiscoveryCache>>,
 ) -> RedisResult<PreparedTopology<C>> {
     let bound = params.connection_timeout;
     let mut best: Option<(usize, Vec<SlotRange>, NodeAddress, C)> = None;
@@ -2815,17 +2827,7 @@ fn prepare_topology<C: ConnectionLike + Connect + Send>(
     nodes.sort_unstable();
     nodes.dedup();
 
-    let strategy = params
-        .read_routing_factory
-        .as_ref()
-        .map(|factory| factory.create_strategy());
-    if let Some(strategy) = strategy
-        .as_deref()
-        .filter(|s| s.requires_node_availability_zones())
-    {
-        let cache = strategy
-            .node_availability_zone_discovery_cache()
-            .unwrap_or(fallback_cache);
+    if let Some(cache) = zone_cache {
         let mut zones = cache.cached_zones(&nodes);
         let missing = |zones: &std::collections::HashMap<NodeAddress, ArcStr>| {
             nodes
