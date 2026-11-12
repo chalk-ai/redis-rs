@@ -2138,8 +2138,10 @@ where
                 );
             }
         }
-        self.slots.borrow_mut().update_slots(moved_hints);
-        self.slot_map_changed();
+        if !moved_hints.is_empty() {
+            self.slots.borrow_mut().update_slots(moved_hints);
+            self.slot_map_changed();
+        }
 
         failed
             .into_iter()
@@ -2300,8 +2302,10 @@ where
             }
         }
 
-        self.slots.borrow_mut().update_slots(moved_hints);
-        self.slot_map_changed();
+        if !moved_hints.is_empty() {
+            self.slots.borrow_mut().update_slots(moved_hints);
+            self.slot_map_changed();
+        }
         let unreachable_redirect_targets =
             self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
         if !unreachable_redirect_targets.is_empty() {

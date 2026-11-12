@@ -2591,6 +2591,101 @@ mod cluster {
         );
     }
 
+    fn check_background_refresh_survives_pipeline_without_moved(retries: u32) {
+        let name = if retries == 0 {
+            "background_refresh_survives_pipeline_give_up"
+        } else {
+            "background_refresh_survives_pipeline_retry"
+        };
+        let armed = Arc::new(atomic::AtomicBool::new(false));
+        let refreshes = Arc::new(atomic::AtomicUsize::new(0));
+        let requests = Arc::new(atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let started_rx = std::sync::Mutex::new(started_rx);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder([format!("redis://{name}")])
+                .periodic_topology_refresh(std::time::Duration::from_millis(20))
+                .retries(retries),
+            name,
+            {
+                let armed = armed.clone();
+                move |command, _| {
+                    if contains_slice(command, b"SLOTS") && armed.load(Ordering::SeqCst) {
+                        // Only the in-flight result reveals the replica: a
+                        // subsequent periodic refresh must not hide its loss.
+                        if refreshes.fetch_add(1, Ordering::SeqCst) != 0 {
+                            return Err(Err((ErrorKind::Client, "Refresh unavailable").into()));
+                        }
+                        started_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                        return respond_startup_with_replica_using_config(
+                            name,
+                            command,
+                            Some(vec![MockSlotRange {
+                                primary_port: 6379,
+                                replica_ports: vec![6381],
+                                slot_range: 0..16383,
+                            }]),
+                        );
+                    }
+                    respond_startup(name, command)?;
+                    if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // Keep the worker in flight until the pipeline has
+                        // planned its retry or exhausted its retry budget.
+                        started_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                        Err(Err(
+                            std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+                        ))
+                    } else {
+                        Err(Ok(Value::Int(123)))
+                    }
+                }
+            },
+        );
+        armed.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let result = cluster_pipe()
+            .get("test")
+            .query::<Vec<i64>>(&mut connection);
+        release_tx.send(()).unwrap();
+        if retries == 0 {
+            assert!(result.unwrap_err().is_timeout());
+        } else {
+            assert_eq!(result, Ok(vec![123]));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while connection.connected_node_count() == 1 && std::time::Instant::now() < deadline {
+            let _: i64 = cmd("GET").arg("test").query(&mut connection).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            connection.connected_node_count(),
+            2,
+            "in-flight replica discovery was discarded"
+        );
+    }
+
+    #[test]
+    fn test_cluster_background_refresh_survives_pipeline_failures() {
+        for retries in [0, 1] {
+            check_background_refresh_survives_pipeline_without_moved(retries);
+        }
+    }
+
     #[test]
     fn test_cluster_periodic_topology_refresh_does_not_block_on_a_hung_node() {
         // Shard 2's primary stops answering for 1.5 s at a time. It is in every
