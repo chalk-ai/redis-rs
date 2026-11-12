@@ -230,3 +230,73 @@ fn custom_callback_order_is_preserved_with_and_without_cloning() {
         );
     }
 }
+
+#[test]
+fn background_workers_are_bounded_and_continue_after_failed_connects() {
+    const LIMIT: usize = 8;
+    const FAILED: u16 = 7000;
+    const NODES: std::ops::Range<u16> = 7000..7041;
+    let name = "compact_background_workers";
+    let added = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let threads = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    set_connect_errors(name, [FAILED]);
+    let MockEnv {
+        mut connection,
+        handler: _handler,
+        ..
+    } = MockEnv::with_client_builder(
+        ClusterClient::builder([format!("redis://{name}")])
+            .periodic_topology_refresh(Duration::from_millis(20))
+            .read_routing_strategy(RoundRobinReplicaStrategy::new()),
+        name,
+        {
+            let added = added.clone();
+            let threads = threads.clone();
+            move |command, port| {
+                if contains_slice(command, b"READONLY") && NODES.contains(&port) {
+                    // Preserve each node's first worker; later metadata queries
+                    // can also connect to this node from the control thread.
+                    threads
+                        .lock()
+                        .unwrap()
+                        .entry(port)
+                        .or_insert_with(|| std::thread::current().id());
+                }
+                if contains_slice(command, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(
+                        name,
+                        command,
+                        Some(vec![MockSlotRange {
+                            primary_port: 6379,
+                            replica_ports: if added.load(Ordering::SeqCst) {
+                                NODES.collect()
+                            } else {
+                                vec![]
+                            },
+                            slot_range: 0..16383,
+                        }]),
+                    );
+                }
+                Err(Ok(Value::Okay))
+            }
+        },
+    );
+    added.store(true, Ordering::SeqCst);
+    wait_for_ports(
+        &mut connection,
+        &std::iter::once(6379)
+            .chain(NODES.filter(|port| *port != FAILED))
+            .collect(),
+    );
+    let threads = threads.lock().unwrap();
+    assert_eq!(
+        threads.len(),
+        40,
+        "a failed connection dropped the rest of its batch"
+    );
+    assert_eq!(
+        threads.values().collect::<HashSet<_>>().len(),
+        LIMIT,
+        "refresh did not reuse a bounded set of workers"
+    );
+}

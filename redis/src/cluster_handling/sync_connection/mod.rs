@@ -427,6 +427,10 @@ impl<C> ClusterConnection<C> {
 /// capping the thread and file-descriptor burst for unusually large topologies.
 const MAX_CONCURRENT_CONNECTS: usize = 256;
 
+/// Per-refresh worker limit for opening background eager-node connections.
+/// Periodic discovery can progress in smaller batches than foreground recovery.
+const MAX_BACKGROUND_CONCURRENT_CONNECTS: usize = 8;
+
 impl<C> ClusterConnection<C>
 where
     // `Send + 'static` is required so connections can be opened on worker
@@ -2878,21 +2882,40 @@ fn prepare_topology<C: ConnectionLike + Connect + Send>(
         .into_iter()
         .filter(|node| !connected.contains(node))
         .collect();
+    // Match the bounded fan-out used by refresh_connections, with a smaller
+    // background limit so a large topology does not create one thread per node.
+    let worker_count = to_open.len().min(MAX_BACKGROUND_CONCURRENT_CONNECTS);
+    let mut buckets: Vec<Vec<NodeAddress>> = (0..worker_count).map(|_| Vec::new()).collect();
+    for (i, addr) in to_open.into_iter().enumerate() {
+        buckets[i % worker_count].push(addr);
+    }
     let connections = std::thread::scope(|scope| {
-        let handles: Vec<_> = to_open
-            .iter()
-            .map(|addr| {
+        let handles: Vec<_> = buckets
+            .into_iter()
+            .map(|bucket| {
                 scope.spawn(move || {
-                    let mut conn =
-                        connect_node::<C>(addr, params, read_timeout, write_timeout).ok()?;
-                    with_refresh_timeout(&mut conn, bound, read_timeout, C::check_connection)
-                        .then(|| (addr.clone(), conn))
+                    let mut opened = Vec::with_capacity(bucket.len());
+                    for addr in bucket {
+                        if let Ok(mut conn) =
+                            connect_node::<C>(&addr, params, read_timeout, write_timeout)
+                            && with_refresh_timeout(
+                                &mut conn,
+                                bound,
+                                read_timeout,
+                                C::check_connection,
+                            )
+                        {
+                            opened.push((addr, conn));
+                        }
+                    }
+                    opened
                 })
             })
             .collect();
         handles
             .into_iter()
-            .filter_map(|h| h.join().ok().flatten())
+            .filter_map(|h| h.join().ok())
+            .flatten()
             .collect()
     });
     Ok(PreparedTopology {
