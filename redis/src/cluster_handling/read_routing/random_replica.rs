@@ -6,6 +6,10 @@ use crate::cluster_handling::NodeAddress;
 pub struct RandomReplicaStrategy;
 
 impl ReadRoutingStrategy for RandomReplicaStrategy {
+    fn clone_for_refresh(&self) -> Option<Box<dyn ReadRoutingStrategy>> {
+        Some(Box::new(Self))
+    }
+
     fn route_read<'a>(&self, candidates: &ReadCandidates<'a>) -> &'a NodeAddress {
         match candidates {
             ReadCandidates::AnyNode(c) => c.replicas().choose_random(),

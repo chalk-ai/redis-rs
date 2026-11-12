@@ -483,7 +483,16 @@ def fault_add_replica(c: Clock, cluster: Cluster) -> None:
     cluster.start_node(7120, f"key-load-delay {KEY_LOAD_DELAY_US}\nloading-process-events-interval-bytes 1024\n")
     cluster.add_replica(7120, 7101)
     c.mark("replica_added")
-    c.wait_until(85, lambda: (lambda i: i.get("loading") == 0 and i.get("master_link_status") == "up")(node(7120, 1).info("all")), "new_replica_synced")
+    c.wait_until(100, lambda: (lambda i: i.get("loading") == 0 and i.get("master_link_status") == "up")(node(7120, 1).info("all")), "new_replica_synced")
+
+
+def fault_hung_replica(c: Clock, cluster: Cluster) -> None:
+    # Holds every reply from 7102 forever. New connections still complete the
+    # TCP handshake (toxiproxy accepts them), so only a timeout ends a command.
+    c.at(FAULT_AT)
+    httpx.post(f"http://127.0.0.1:{TOXI_PORT}/proxies/victim/toxics", json={
+        "name": "hang", "type": "timeout", "stream": "downstream", "attributes": {"timeout": 0}}).raise_for_status()
+    c.mark("replica_hung")
 
 
 def fault_remove_replica(c: Clock, cluster: Cluster) -> None:
@@ -538,7 +547,7 @@ SCENARIOS = [
     Scenario("failover", "Shard A's primary (us-east-1a) is killed; the us-east-1b replica is promoted; the old primary comes back empty 30 s later and rejoins as a replica.",
              Boot(shards=3, failover=True, spare_shard_c=False), 80, fault_failover, [
                  Check("reads lost, all zones", lambda r: r.lost_pct("reads", ALL, FAULT_AT, 75), "<=", 5, "%", "pass"),
-                 Check("writes back to 90% after promotion", lambda r: r.recovery_s("writes", ALL, r.event("replica_promoted")), "<=", 10, "s", "known_gap"),
+                 Check("writes back to 90% after promotion", lambda r: r.recovery_s("writes", ALL, r.event("replica_promoted")), "<=", 10, "s", "pass"),
              ]),
     Scenario("primary_wipe", "Two primaries, so a dead one can never be marked FAIL: shard A's primary is killed and restarted empty 15 s later, and its replicas copy the empty dataset.",
              Boot(shards=2, failover=True, spare_shard_c=False), 70, fault_primary_wipe, [
@@ -557,16 +566,26 @@ SCENARIOS = [
              Boot(shards=3, failover=False, spare_shard_c=False), 80, drain_shard_c(True), [
                  Check("read errors after removal", lambda r: r.count("reads", ALL, "err", r.event("shard_c_removed") + 2, 79), "<=", 0, "reads", "pass"),
                  Check("reads lost after removal", lambda r: r.lost_pct("reads", ALL, r.event("shard_c_removed") + 2, 79), "<=", 5, "%", "pass"),
-                 Check("writes lost after removal", lambda r: r.lost_pct("writes", ALL, r.event("shard_c_removed") + 5, 79), "<=", 2, "%", "known_gap"),
+                 Check("writes lost after removal", lambda r: r.lost_pct("writes", ALL, r.event("shard_c_removed") + 5, 79), "<=", 2, "%", "pass"),
              ]),
     Scenario("reshard_down_reset", "Same drain, but the removed nodes stay up after CLUSTER RESET (what `valkey-cli --cluster del-node` leaves) and answer CLUSTERDOWN.",
              Boot(shards=3, failover=False, spare_shard_c=False), 80, drain_shard_c(False), [
-                 Check("threads stuck when the run ends", lambda r: r.harness["threads_stuck_at_end"], "<=", 0, "threads", "known_gap"),
-                 Check("reads lost after removal", lambda r: r.lost_pct("reads", ALL, r.event("shard_c_removed") + 2, 79), "<=", 5, "%", "known_gap"),
+                 Check("threads stuck when the run ends", lambda r: r.harness["threads_stuck_at_end"], "<=", 0, "threads", "pass"),
+                 Check("reads lost after removal", lambda r: r.lost_pct("reads", ALL, r.event("shard_c_removed") + 2, 79), "<=", 5, "%", "pass"),
              ]),
+    # 160 s so a full default periodic refresh interval (60 s, jittered up to
+    # 75 s) fits after the new replica finishes syncing (~50 s).
     Scenario("add_replica", "A second us-east-1a replica joins shard A and fully syncs.",
-             TWO, 90, fault_add_replica, [
-                 Check("reads served by the new replica after it synced", lambda r: r.node_gets(7120, r.event("new_replica_synced"), 89), ">=", 1, "reads", "known_gap"),
+             TWO, 160, fault_add_replica, [
+                 Check("reads served by the new replica after it synced", lambda r: r.node_gets(7120, r.event("new_replica_synced"), 159), ">=", 1, "reads", "pass"),
+             ]),
+    # 110 s so every connection runs a periodic refresh (default 60 s, jittered
+    # down to 45 s) while the replica is hung.
+    Scenario("hung_replica", "The lone us-east-1a replica keeps accepting connections but never answers again; every client keeps running periodic topology refreshes.",
+             TWO, 110, fault_hung_replica, [
+                 Check("threads stuck when the run ends", lambda r: r.harness["threads_stuck_at_end"], "<=", 0, "threads", "pass"),
+                 Check("hung thread-seconds, all zones", lambda r: r.hung_thread_s(FAULT_AT, r.duration), "<=", 5, "thread-s", "pass"),
+                 Check("us-east-1a reads lost", lambda r: r.lost_pct("reads", A1, FAULT_AT + 5, 105), "<=", 5, "%", "pass"),
              ]),
     Scenario("remove_replica", "The lone us-east-1a replica of shard A is shut down and forgotten by every node; its address refuses connections.",
              TWO, 45, fault_remove_replica, [

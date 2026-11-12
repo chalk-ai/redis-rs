@@ -24,7 +24,7 @@ Requirements:
 # With nix:
 nix shell nixpkgs#valkey nixpkgs#toxiproxy nixpkgs#uv
 
-fault-matrix/run.py                    # every scenario, about 20 minutes
+fault-matrix/run.py                    # every scenario, about 30 minutes
 fault-matrix/run.py resync failover    # a subset
 fault-matrix/run.py --list             # scenarios and their checks
 fault-matrix/run.py --response-timeout-ms none   # without a response timeout
@@ -76,12 +76,13 @@ Every check has one of three expectations:
 | `slow_under_timeout` | Lone 1a replica 100 ms slow for 30 s | known gap: no latency-based ejection |
 | `cpu_saturation` | Lone 1a replica's main thread saturated for 30 s | known gap: same |
 | `busy_script` | Lone 1a replica blocked by a script, answering `BUSY` | pass |
-| `failover` | Shard A primary killed, a 1b replica promoted, the old primary rejoins empty | reads pass; writes known gap: no slot-map refresh after connection failures |
+| `failover` | Shard A primary killed, a 1b replica promoted, the old primary rejoins empty | pass |
 | `primary_wipe` | A primary restarts empty before it can be failed over; its replicas copy the empty dataset | info |
 | `reshard_up` | A new shard joins and a third of the slots migrate to it | pass |
-| `reshard_down` | A shard is drained and its nodes terminated | reads pass; writes known gap |
-| `reshard_down_reset` | Same, but the drained nodes stay up answering `CLUSTERDOWN` | known gap: `CLUSTERDOWN` never triggers a refresh |
-| `add_replica` | A second 1a replica joins shard A | known gap: no periodic topology refresh |
+| `reshard_down` | A shard is drained and its nodes terminated | pass |
+| `reshard_down_reset` | Same, but the drained nodes stay up answering `CLUSTERDOWN` | pass |
+| `add_replica` | A second 1a replica joins shard A | pass |
+| `hung_replica` | The lone 1a replica accepts connections but never answers again, through several periodic refreshes | pass |
 | `remove_replica` | The lone 1a replica is removed | pass |
 
 `fault-matrix/run.py --list` prints the exact thresholds.

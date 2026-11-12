@@ -71,6 +71,14 @@ use crate::tls::{TlsCertificates, retrieve_tls_certificates};
 /// behaviour.
 const DEFAULT_MIN_SLOT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Default interval between topology refreshes made while nothing is failing.
+///
+/// Without them a client only learns about topology changes that produce an
+/// error or a redirect for it, so a replica added to the cluster is never
+/// used. 60 seconds matches the periodic refresh AWS recommends for
+/// ElastiCache clients and Lettuce's default.
+const DEFAULT_PERIODIC_TOPOLOGY_REFRESH: Duration = Duration::from_secs(60);
+
 /// Parameters specific to builder, so that
 /// builder parameters may have different types
 /// than final ClusterParams
@@ -87,6 +95,7 @@ struct BuilderParams {
     danger_accept_invalid_hostnames: bool,
     retries_configuration: RetryParams,
     min_slot_refresh_interval: Option<Duration>,
+    periodic_topology_refresh: Option<Duration>,
     connection_timeout: Option<Duration>,
     response_timeout: Option<Duration>,
     protocol: Option<ProtocolVersion>,
@@ -156,6 +165,9 @@ pub(crate) struct ClusterParams {
     pub(crate) tls: Option<TlsMode>,
     pub(crate) retry_params: RetryParams,
     pub(crate) min_slot_refresh_interval: Duration,
+    /// Interval between refreshes made while nothing is failing;
+    /// [`Duration::ZERO`] disables them.
+    pub(crate) periodic_topology_refresh: Duration,
     pub(crate) tls_params: Option<TlsConnParams>,
     pub(crate) connection_timeout: Duration,
     pub(crate) response_timeout: Option<Duration>,
@@ -219,6 +231,9 @@ impl ClusterParams {
             min_slot_refresh_interval: value
                 .min_slot_refresh_interval
                 .unwrap_or(DEFAULT_MIN_SLOT_REFRESH_INTERVAL),
+            periodic_topology_refresh: value
+                .periodic_topology_refresh
+                .unwrap_or(DEFAULT_PERIODIC_TOPOLOGY_REFRESH),
             tls_params,
             connection_timeout: value
                 .connection_timeout
@@ -414,10 +429,29 @@ impl ClusterClientBuilder {
     /// [`Duration::ZERO`] refreshes on every MOVED, which is the historical
     /// behaviour and is very expensive against a resharding cluster.
     ///
-    /// This does not affect refreshes triggered by anything other than a MOVED —
-    /// a lost connection still refreshes immediately.
+    /// This does not affect refreshes triggered by anything other than a MOVED.
+    /// A node that cannot be reconnected or that answers `CLUSTERDOWN` triggers
+    /// a refresh at most about once a second per connection, and periodic
+    /// refreshes follow [`Self::periodic_topology_refresh`].
     pub fn min_slot_refresh_interval(mut self, interval: Duration) -> ClusterClientBuilder {
         self.builder_params.min_slot_refresh_interval = Some(interval);
+        self
+    }
+
+    /// Sets how often a sync cluster connection refreshes its topology while
+    /// nothing is failing.
+    ///
+    /// Defaults to 60 seconds, jittered so pooled connections do not refresh
+    /// together. Without periodic refreshes a connection only learns about
+    /// changes that cause it an error or a redirect, so it never uses a replica
+    /// added after it connected. The refresh runs on a background thread with
+    /// its own connections, started by the first command after the interval
+    /// elapses, so a node that has stopped answering delays the refresh rather
+    /// than that command; a later command installs the result without I/O.
+    ///
+    /// [`Duration::ZERO`] disables periodic refreshes.
+    pub fn periodic_topology_refresh(mut self, interval: Duration) -> ClusterClientBuilder {
+        self.builder_params.periodic_topology_refresh = Some(interval);
         self
     }
 
@@ -873,7 +907,7 @@ impl ClusterClient {
     #[doc(hidden)]
     pub fn get_generic_connection<C>(&self) -> RedisResult<cluster::ClusterConnection<C>>
     where
-        C: crate::ConnectionLike + crate::cluster::Connect + Send,
+        C: crate::ConnectionLike + crate::cluster::Connect + Send + 'static,
     {
         cluster::ClusterConnection::new(self.cluster_params.clone(), self.initial_nodes.clone())
     }
@@ -884,7 +918,7 @@ impl ClusterClient {
         config: cluster::ClusterConfig,
     ) -> RedisResult<cluster::ClusterConnection<C>>
     where
-        C: crate::ConnectionLike + crate::cluster::Connect + Send,
+        C: crate::ConnectionLike + crate::cluster::Connect + Send + 'static,
     {
         cluster::ClusterConnection::new(
             self.cluster_params.clone().with_config(config),
