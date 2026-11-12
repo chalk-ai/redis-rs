@@ -5,6 +5,7 @@ members = [
   "valkey",
   "afl/parser",
   "test-macros",
+  "fault-matrix",
 ]
 resolver = "2"
 

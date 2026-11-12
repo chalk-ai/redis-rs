@@ -397,6 +397,25 @@ impl<'a> ReadCandidates<'a> {
 /// }
 /// ```
 pub trait ReadRoutingStrategy: Send + Sync {
+    /// Creates an independent strategy for preparing a background topology refresh.
+    ///
+    /// Preserve per-connection configuration and affinity, such as a random seed.
+    /// The clone receives [`on_topology_changed`](Self::on_topology_changed)
+    /// before its eager connection set is queried. Those calls must not change
+    /// the live strategy's routing state or publish the uninstalled topology to
+    /// shared consumers. Health and availability-zone caches may remain shared.
+    /// The clone does not need to copy routing state that the callback rebuilds.
+    /// This method runs on the foreground thread before spawning the refresh,
+    /// so implementations should return quickly.
+    ///
+    /// The default keeps existing custom strategies compatible: background
+    /// refreshes prepare connections to all topology nodes, then the live
+    /// strategy receives its usual callbacks when the result is installed and
+    /// connections outside its eager set are dropped.
+    fn clone_for_refresh(&self) -> Option<Box<dyn ReadRoutingStrategy>> {
+        None
+    }
+
     /// Returns shared availability-zone discovery state for strategies that
     /// need per-node zone metadata.
     #[doc(hidden)]

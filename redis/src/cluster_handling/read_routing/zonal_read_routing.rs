@@ -141,6 +141,10 @@ impl ReadRoutingStrategyFactory for ZonalReadRoutingStrategy {
 }
 
 impl ReadRoutingStrategy for ZonalReadRoutingStrategy {
+    fn clone_for_refresh(&self) -> Option<Box<dyn ReadRoutingStrategy>> {
+        Some(Box::new(self.clone()))
+    }
+
     fn node_availability_zone_discovery_cache(
         &self,
     ) -> Option<Arc<dyn NodeAvailabilityZoneDiscoveryCache>> {
@@ -293,6 +297,24 @@ mod tests {
             .into_iter()
             .collect(),
         )
+    }
+
+    #[test]
+    fn refresh_clone_isolates_routing_state_and_shares_health() {
+        let strategy = ZonalReadRoutingStrategy::new("us-east-1b");
+        strategy.on_topology_changed(topology());
+        let replicas = [
+            node("replica1a", 6379),
+            node("replica1b", 6379),
+            node("replica1c", 6379),
+        ];
+        let candidates = ReadCandidates::replicas_only(1, Replicas::new(&replicas).unwrap());
+        assert_eq!(strategy.route_read(&candidates), &replicas[0]);
+        let cloned = strategy.clone_for_refresh().unwrap();
+        cloned.on_topology_changed(ClusterTopology::from_shards(vec![]));
+        assert_eq!(strategy.route_read(&candidates), &replicas[2]);
+        cloned.on_read_outcome(&replicas[0], ReadOutcome::Unavailable);
+        assert!(strategy.circuit_breaker().unwrap().is_open(&replicas[0]));
     }
 
     #[test]

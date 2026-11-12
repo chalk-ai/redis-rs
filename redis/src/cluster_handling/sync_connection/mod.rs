@@ -62,9 +62,10 @@
 //! });
 //! let _: redis::Value = connection.route_command(&redis::cmd("PING"), routing_info).unwrap();
 //! ```
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -86,7 +87,7 @@ use super::{
         ReadRoutingStrategy,
     },
     routing::{Redirect, Route, RoutingInfo},
-    slot_map::SlotMap,
+    slot_map::{SLOT_SIZE, SlotMap, SlotRange},
 };
 use crate::IntoConnectionInfo;
 pub use crate::TlsMode; // Pub for backwards compatibility
@@ -101,7 +102,7 @@ use crate::errors::{ErrorKind, RedisError, RetryMethod};
 use crate::parser::parse_redis_value;
 use crate::types::{HashMap, RedisResult, Value};
 use pipeline::UNROUTABLE_ERROR;
-use rand::{Rng, rng, seq::IteratorRandom};
+use rand::{Rng, rng, seq::IteratorRandom, seq::SliceRandom};
 
 pub use pipeline::{ClusterPipeline, cluster_pipe};
 
@@ -360,8 +361,41 @@ pub struct ClusterConnection<C = Connection> {
     /// map. `None` means one is allowed now. See
     /// [`Self::refresh_slots_rate_limited`].
     next_slot_refresh: RefCell<Option<Instant>>,
+    /// Earliest instant at which a failure may trigger another full refresh.
+    /// See [`Self::refresh_slots_after_error`].
+    next_error_refresh: RefCell<Option<Instant>>,
+    /// When the next periodic refresh is due, or `None` when they are disabled.
+    /// See [`Self::refresh_slots_if_due`].
+    next_periodic_refresh: RefCell<Option<Instant>>,
+    /// A periodic refresh running on a background thread, if one is in flight.
+    pending_topology: RefCell<Option<PendingTopology<C>>>,
+    /// Bumped whenever this connection's slot map changes, so a background
+    /// refresh that started before the change is not adopted over it.
+    slot_map_generation: Cell<u64>,
     cluster_params: ClusterParams,
 }
+
+/// A periodic refresh in flight on a background thread.
+struct PendingTopology<C> {
+    /// `slot_map_generation` when the refresh started.
+    generation: u64,
+    result: mpsc::Receiver<RedisResult<PreparedTopology<C>>>,
+}
+
+/// A topology fetched off the request path, ready to install without I/O.
+struct PreparedTopology<C> {
+    /// The new slot map, with node availability zones already attached.
+    slots: SlotMap,
+    /// Connections opened to eager nodes the cluster connection did not have.
+    connections: Vec<(NodeAddress, C)>,
+}
+
+/// Minimum spacing between refreshes triggered by a node that cannot be
+/// reached or that answers `CLUSTERDOWN`. Long enough that every pooled
+/// connection retrying through an outage cannot turn into a `CLUSTER SLOTS`
+/// storm, short enough that a failover is picked up within a couple of
+/// seconds of the promotion rather than at the next 30 s MOVED-refresh window.
+const ERROR_REFRESH_FLOOR: Duration = Duration::from_secs(1);
 
 impl<C> ClusterConnection<C> {
     /// Returns the node addresses that currently have open connections.
@@ -393,11 +427,16 @@ impl<C> ClusterConnection<C> {
 /// capping the thread and file-descriptor burst for unusually large topologies.
 const MAX_CONCURRENT_CONNECTS: usize = 256;
 
+/// Per-refresh worker limit for opening background eager-node connections.
+/// Periodic discovery can progress in smaller batches than foreground recovery.
+const MAX_BACKGROUND_CONCURRENT_CONNECTS: usize = 8;
+
 impl<C> ClusterConnection<C>
 where
-    // `Send` is required so connections can be opened on worker threads during
-    // parallel connection refresh (see `refresh_slots`).
-    C: ConnectionLike + Connect + Send,
+    // `Send + 'static` is required so connections can be opened on worker
+    // threads during parallel connection refresh (see `refresh_slots`) and by
+    // the background periodic refresh (see `refresh_slots_if_due`).
+    C: ConnectionLike + Connect + Send + 'static,
 {
     pub(crate) fn new(
         cluster_params: ClusterParams,
@@ -426,6 +465,10 @@ where
             tracks_node_health,
             az_discovery: Arc::new(NodeAvailabilityZoneDiscoveryState::default()),
             next_slot_refresh: RefCell::new(None),
+            next_error_refresh: RefCell::new(None),
+            next_periodic_refresh: RefCell::new(None),
+            pending_topology: RefCell::new(None),
+            slot_map_generation: Cell::new(0),
             initial_nodes: initial_nodes.to_vec(),
             cluster_params,
         };
@@ -605,9 +648,165 @@ where
         *self.next_slot_refresh.borrow_mut() = Some(Instant::now() + interval.mul_f64(jitter));
     }
 
+    /// Refreshes the whole slot map after a failure that may mean the topology
+    /// changed: a node that refuses connections, or one that answers
+    /// `CLUSTERDOWN`. Spaced by [`ERROR_REFRESH_FLOOR`] rather than the MOVED
+    /// interval, because unlike a MOVED nothing else tells the client where
+    /// the slot went.
+    ///
+    /// Returns whether a refresh was attempted, including a failed attempt.
+    fn refresh_slots_after_error(&self) -> bool {
+        if let Some(next) = *self.next_error_refresh.borrow() {
+            if Instant::now() < next {
+                return false;
+            }
+        }
+        // The command that failed has its own retry and error path; a refresh
+        // that fails here leaves the current map, and the next failure retries it.
+        let _ = self.refresh_slots();
+        true
+    }
+
+    /// Refreshes the whole slot map if the periodic refresh is due.
+    ///
+    /// The refresh itself runs on a background thread with its own
+    /// connections: it may have to wait on a node that has stopped answering,
+    /// and the command that happens to find it due must not wait with it. That
+    /// command only starts it; a later command installs the result, which
+    /// involves no I/O.
+    fn refresh_slots_if_due(&self) {
+        self.install_background_topology();
+        let due = (*self.next_periodic_refresh.borrow()).is_some_and(|next| Instant::now() >= next);
+        if !due || self.pending_topology.borrow().is_some() {
+            return;
+        }
+        self.arm_periodic_refresh(Instant::now());
+        self.spawn_background_topology();
+    }
+
+    fn spawn_background_topology(&self) {
+        let connected: HashSet<NodeAddress> = self.connections.borrow().keys().cloned().collect();
+        // Ask the nodes this connection already reaches, in random order so
+        // connections do not all start with the same node, then the seeds.
+        let mut candidates: Vec<NodeAddress> = connected.iter().cloned().collect();
+        candidates.shuffle(&mut rng());
+        for info in &self.initial_nodes {
+            if let Ok(addr) = NodeAddress::try_from(&info.addr) {
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+        }
+        let params = self.cluster_params.clone();
+        let timeouts = (*self.read_timeout.borrow(), *self.write_timeout.borrow());
+        let strategy = self.routing_strategy.as_deref();
+        let refresh_strategy = strategy.and_then(ReadRoutingStrategy::clone_for_refresh);
+        let zone_cache = refresh_strategy
+            .as_deref()
+            .or(strategy)
+            .filter(|strategy| strategy.requires_node_availability_zones())
+            .map(|strategy| {
+                strategy
+                    .node_availability_zone_discovery_cache()
+                    .unwrap_or_else(|| self.az_discovery.clone())
+            });
+        let (tx, rx) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name("redis-topology-refresh".to_owned())
+            .spawn(move || {
+                // The receiver is gone if the connection was dropped meanwhile.
+                let _ = tx.send(prepare_topology::<C>(
+                    &params,
+                    candidates,
+                    &connected,
+                    timeouts,
+                    refresh_strategy,
+                    zone_cache,
+                ));
+            });
+        if spawned.is_ok() {
+            *self.pending_topology.borrow_mut() = Some(PendingTopology {
+                generation: self.slot_map_generation.get(),
+                result: rx,
+            });
+        }
+    }
+
+    /// Installs a finished background refresh, if there is one. Discards it
+    /// when this connection's slot map changed after the refresh started: a
+    /// MOVED hint or an error-driven refresh since then is newer information.
+    fn install_background_topology(&self) {
+        let finished = {
+            let pending = self.pending_topology.borrow();
+            let Some(pending) = pending.as_ref() else {
+                return;
+            };
+            match pending.result.try_recv() {
+                Ok(result) => Some((pending.generation, result)),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        *self.pending_topology.borrow_mut() = None;
+        let Some((generation, Ok(prepared))) = finished else {
+            return;
+        };
+        if generation != self.slot_map_generation.get() {
+            return;
+        }
+
+        let all_nodes =
+            || -> HashSet<NodeAddress> { prepared.slots.values().flatten().cloned().collect() };
+        let eager = match &self.routing_strategy {
+            Some(strategy) => {
+                let topology = prepared.slots.topology();
+                strategy.on_topology_changed(topology.clone());
+                strategy
+                    .eager_connection_nodes(&topology)
+                    .unwrap_or_else(all_nodes)
+            }
+            None => all_nodes(),
+        };
+        *self.slots.borrow_mut() = prepared.slots;
+        self.slot_map_changed();
+        // A full map was just learned; MOVED hints need not refetch one.
+        self.arm_slot_refresh_deadline();
+
+        let mut connections = self.connections.borrow_mut();
+        connections.retain(|addr, _| eager.contains(addr));
+        for (addr, conn) in prepared.connections {
+            if eager.contains(&addr) {
+                connections.entry(addr).or_insert(conn);
+            }
+        }
+        self.notify_connections_changed(&connections);
+    }
+
+    fn slot_map_changed(&self) {
+        self.slot_map_generation
+            .set(self.slot_map_generation.get().wrapping_add(1));
+    }
+
+    fn arm_periodic_refresh(&self, now: Instant) {
+        let interval = self.cluster_params.periodic_topology_refresh;
+        *self.next_periodic_refresh.borrow_mut() =
+            (!interval.is_zero()).then(|| now + interval.mul_f64(rng().random_range(0.75..1.25)));
+    }
+
+    /// Arms the error and periodic refresh deadlines. Called by every full
+    /// refresh, before it runs, for the same reason as
+    /// [`Self::arm_slot_refresh_deadline`].
+    fn arm_topology_refresh_deadlines(&self) {
+        let now = Instant::now();
+        *self.next_error_refresh.borrow_mut() =
+            Some(now + ERROR_REFRESH_FLOOR.mul_f64(rng().random_range(0.5..1.5)));
+        self.arm_periodic_refresh(now);
+    }
+
     // Query a node to discover slot-> master mappings.
     fn refresh_slots(&self) -> RedisResult<()> {
         self.arm_slot_refresh_deadline();
+        self.arm_topology_refresh_deadlines();
         let mut new_slots = self.create_new_slots()?;
 
         if let Some(ref strategy) = self.routing_strategy {
@@ -627,6 +826,7 @@ where
             nodes.dedup();
 
             *self.slots.borrow_mut() = new_slots;
+            self.slot_map_changed();
             self.refresh_connections(nodes);
             return Ok(());
         }
@@ -636,6 +836,7 @@ where
         nodes.dedup();
 
         *self.slots.borrow_mut() = new_slots;
+        self.slot_map_changed();
         self.refresh_connections(nodes);
 
         Ok(())
@@ -685,8 +886,14 @@ where
                             let mut opened = Vec::with_capacity(bucket.len());
                             for (addr, existing) in bucket {
                                 // Reuse a still-healthy existing connection if we have one.
+                                let bound = cluster_params.connection_timeout;
                                 if let Some(mut conn) = existing {
-                                    if conn.check_connection() {
+                                    if with_refresh_timeout(
+                                        &mut conn,
+                                        bound,
+                                        read_timeout,
+                                        C::check_connection,
+                                    ) {
                                         opened.push((addr, conn));
                                         continue;
                                     }
@@ -698,7 +905,12 @@ where
                                     read_timeout,
                                     write_timeout,
                                 ) {
-                                    if conn.check_connection() {
+                                    if with_refresh_timeout(
+                                        &mut conn,
+                                        bound,
+                                        read_timeout,
+                                        C::check_connection,
+                                    ) {
                                         opened.push((addr, conn));
                                     }
                                 }
@@ -722,28 +934,81 @@ where
         self.notify_connections_changed(&connections);
     }
 
+    /// Fetches the slot map from the first node whose `CLUSTER SLOTS` reply
+    /// covers every slot.
+    ///
+    /// Any single node may be the wrong one to ask: it may be dead, stalled
+    /// past the response timeout, or removed from the cluster by
+    /// `CLUSTER RESET` and now claiming no slots at all. So a node that errors
+    /// is skipped, and a reply that leaves slots uncovered is kept only as a
+    /// fallback for a cluster that really does run with partial coverage.
+    /// When no connected node answers, the seed nodes are asked too.
     fn create_new_slots(&self) -> RedisResult<SlotMap> {
-        let mut connections = self.connections.borrow_mut();
-        let mut new_slots = None;
+        let mut best: Option<(usize, Vec<SlotRange>)> = None;
+        let mut last_error = None;
+        let (bound, configured) = (
+            self.cluster_params.connection_timeout,
+            *self.read_timeout.borrow(),
+        );
+        let mut consider = |addr: &NodeAddress, conn: &mut C| -> bool {
+            let reply = with_refresh_timeout(conn, bound, configured, |conn| {
+                conn.req_command(&slot_cmd())
+            });
+            let parsed = reply.and_then(|value| {
+                parse_slots(
+                    value,
+                    addr.host(),
+                    self.cluster_params.replica_filter.as_deref(),
+                )
+            });
+            match parsed {
+                Ok(slots) => {
+                    let covered = slots
+                        .iter()
+                        .map(|range| usize::from(range.end - range.start) + 1)
+                        .sum::<usize>();
+                    let complete = covered >= usize::from(SLOT_SIZE);
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_covered, _)| covered > *best_covered)
+                    {
+                        best = Some((covered, slots));
+                    }
+                    complete
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    false
+                }
+            }
+        };
 
-        for (addr, conn) in connections.iter_mut() {
-            let value = conn.req_command(&slot_cmd())?;
-            if let Ok(slots_data) = parse_slots(
-                value,
-                addr.host(),
-                self.cluster_params.replica_filter.as_deref(),
-            ) {
-                new_slots = Some(SlotMap::from_slots(slots_data));
-                break;
+        let found_complete = self
+            .connections
+            .borrow_mut()
+            .iter_mut()
+            .any(|(addr, conn)| consider(addr, conn));
+        if !found_complete {
+            for info in &self.initial_nodes {
+                let Ok(addr) = NodeAddress::try_from(&info.addr) else {
+                    continue;
+                };
+                if let Ok(mut conn) = self.connect(&addr) {
+                    if consider(&addr, &mut conn) {
+                        break;
+                    }
+                }
             }
         }
 
-        match new_slots {
-            Some(new_slots) => Ok(new_slots),
-            None => Err(RedisError::from((
-                ErrorKind::Client,
-                "Slot refresh error. didn't get any slots from server",
-            ))),
+        match best {
+            Some((covered, slots)) if covered > 0 => Ok(SlotMap::from_slots(slots)),
+            _ => Err(last_error.unwrap_or_else(|| {
+                RedisError::from((
+                    ErrorKind::Client,
+                    "Slot refresh error. didn't get any slots from server",
+                ))
+            })),
         }
     }
 
@@ -886,11 +1151,16 @@ where
         &self,
     ) -> std::collections::HashMap<NodeAddress, ArcStr> {
         let mut connections = self.connections.borrow_mut();
+        let (bound, configured) = (
+            self.cluster_params.connection_timeout,
+            *self.read_timeout.borrow(),
+        );
 
         for (addr, conn) in connections.iter_mut() {
-            let value = conn
-                .req_command(&shard_cmd())
-                .and_then(|value| value.extract_error());
+            let value = with_refresh_timeout(conn, bound, configured, |conn| {
+                conn.req_command(&shard_cmd())
+            })
+            .and_then(|value| value.extract_error());
             if let Ok(value) = value {
                 let zones = parse_cluster_shards_availability_zones(&value, addr.host());
                 if !zones.is_empty() {
@@ -916,7 +1186,7 @@ where
                 let mut connections = self.connections.borrow_mut();
                 connections
                     .get_mut(&node)
-                    .and_then(Self::query_info_server_availability_zone)
+                    .and_then(|conn| self.query_info_server_availability_zone(conn))
             };
 
             let zone = match zone {
@@ -924,7 +1194,7 @@ where
                 None => self
                     .connect(&node)
                     .ok()
-                    .and_then(|mut conn| Self::query_info_server_availability_zone(&mut conn)),
+                    .and_then(|mut conn| self.query_info_server_availability_zone(&mut conn)),
             };
 
             if let Some(zone) = zone {
@@ -935,11 +1205,16 @@ where
         zones
     }
 
-    fn query_info_server_availability_zone(conn: &mut C) -> Option<ArcStr> {
-        let value = conn
-            .req_command(&info_server_cmd())
-            .and_then(|value| value.extract_error())
-            .ok()?;
+    fn query_info_server_availability_zone(&self, conn: &mut C) -> Option<ArcStr> {
+        let (bound, configured) = (
+            self.cluster_params.connection_timeout,
+            *self.read_timeout.borrow(),
+        );
+        let value = with_refresh_timeout(conn, bound, configured, |conn| {
+            conn.req_command(&info_server_cmd())
+        })
+        .and_then(|value| value.extract_error())
+        .ok()?;
         let info = crate::from_redis_value::<String>(value).ok()?;
         parse_info_server_availability_zone(&info)
     }
@@ -1174,6 +1449,10 @@ where
             excluded_nodes.pop();
         }
         has_alternative
+    }
+
+    fn is_cluster_down(err: &RedisError) -> bool {
+        err.kind() == ErrorKind::Server(crate::ServerErrorKind::ClusterDown)
     }
 
     fn note_read_node_failure(
@@ -1511,6 +1790,7 @@ where
     #[inline(always)]
     #[allow(clippy::unnecessary_unwrap)]
     fn request(&self, input: Input, route_option: Option<RoutingInfo>) -> RedisResult<Output> {
+        self.refresh_slots_if_due();
         if self.read_fallback_enabled {
             self.request_inner::<true, false>(input, route_option, None)
         } else {
@@ -1555,11 +1835,29 @@ where
                 // A MOVED target may already have left the cluster or be unreachable
                 // from this client. Publishing it before connecting would poison the
                 // shared slot map for later requests.
-                {
+                let acquired = {
                     let mut connections = self.connections.borrow_mut();
-                    self.get_connection_by_addr(&mut connections, &addr)?;
+                    self.get_connection_by_addr(&mut connections, &addr)
+                        .map(|_| ())
+                };
+                if let Err(err) = acquired {
+                    if !*self.auto_reconnect.borrow()
+                        || matches!(err.retry_method(), RetryMethod::NoRetry)
+                    {
+                        return Err(err);
+                    }
+                    // Nothing was sent to this redirect target. Drop the hint
+                    // and consult the cluster before routing the next attempt.
+                    redirected = None;
+                    self.refresh_slots_after_error();
+                    if retries == self.cluster_params.retry_params.number_of_retries {
+                        return Err(err);
+                    }
+                    retries += 1;
+                    continue;
                 }
                 self.slots.borrow_mut().update_slot(slot, addr);
+                self.slot_map_changed();
                 self.refresh_slots_rate_limited()?;
             }
 
@@ -1576,24 +1874,16 @@ where
             };
 
             // Get target address and response.
-            let (addr, rv) = {
+            let (addr, rv, connection_failed) = {
                 let mut connections = self.connections.borrow_mut();
+                let mut asking = false;
                 let (addr, conn) = if let Some(redirected) = redirected.take() {
                     let (addr, is_asking) = match redirected {
                         Redirect::Moved(addr) => (addr, false),
                         Redirect::Ask(addr) => (addr, true),
                     };
-                    let mut conn = self.get_connection_by_addr(&mut connections, &addr);
-                    if is_asking {
-                        // if we are in asking mode we want to feed a single
-                        // ASKING command into the connection before what we
-                        // actually want to execute.
-                        conn = conn.and_then(|conn| {
-                            conn.req_packed_command(ASKING)
-                                .and_then(|value| value.extract_error())?;
-                            Ok(conn)
-                        });
-                    }
+                    asking = is_asking;
+                    let conn = self.get_connection_by_addr(&mut connections, &addr);
                     (addr, conn)
                 } else {
                     match &single_node_routing {
@@ -1626,7 +1916,18 @@ where
                         }
                     }
                 };
-                (addr, conn.and_then(|conn| input.send(conn)))
+                // Preserve the failure phase: a connect timeout and a response
+                // timeout share an error kind, but only the former means that
+                // this request could not acquire a connection to its target.
+                let connection_failed = conn.is_err();
+                let rv = conn.and_then(|conn| {
+                    if asking {
+                        conn.req_packed_command(ASKING)
+                            .and_then(|value| value.extract_error())?;
+                    }
+                    input.send(conn)
+                });
+                (addr, rv, connection_failed)
             };
 
             if read_route.is_some() {
@@ -1636,6 +1937,15 @@ where
             match rv {
                 Ok(rv) => return Ok(rv),
                 Err(err) => {
+                    // Refresh only after releasing the connection/slot borrows.
+                    // In particular, TimedOut is RetryImmediately and otherwise
+                    // bypasses the failed-reconnect recovery below.
+                    if connection_failed
+                        && matches!(err.retry_method(), RetryMethod::RetryImmediately)
+                        && *self.auto_reconnect.borrow()
+                    {
+                        self.refresh_slots_after_error();
+                    }
                     if err.kind() == ErrorKind::ClusterConnectionNotFound
                         && *self.auto_reconnect.borrow()
                     {
@@ -1699,6 +2009,12 @@ where
                                     )
                                 });
                             if !rerouted {
+                                // CLUSTERDOWN may come from a node that no
+                                // longer serves the slot at all (drained and
+                                // reset); retrying it would never succeed.
+                                if Self::is_cluster_down(&err) {
+                                    self.refresh_slots_after_error();
+                                }
                                 let sleep_time = self
                                     .cluster_params
                                     .retry_params
@@ -1716,14 +2032,28 @@ where
                             }
                             if *self.auto_reconnect.borrow() {
                                 // if the connection is no longer valid, we should remove it.
-                                let mut connections = self.connections.borrow_mut();
-                                connections.remove(&addr);
-                                if let Ok(mut conn) = self.connect(&addr) {
-                                    if conn.check_connection() {
-                                        connections.insert(addr, conn);
-                                    }
+                                let reconnected = {
+                                    let mut connections = self.connections.borrow_mut();
+                                    connections.remove(&addr);
+                                    let reconnected = match self.connect(&addr) {
+                                        Ok(mut conn) => {
+                                            let healthy = conn.check_connection();
+                                            if healthy {
+                                                connections.insert(addr, conn);
+                                            }
+                                            healthy
+                                        }
+                                        Err(_) => false,
+                                    };
+                                    self.notify_connections_changed(&connections);
+                                    reconnected
+                                };
+                                // A node that cannot be reached again may have
+                                // been failed over or removed. Nothing redirects
+                                // the client away from it, so ask the cluster.
+                                if !reconnected {
+                                    self.refresh_slots_after_error();
                                 }
-                                self.notify_connections_changed(&connections);
                             }
                         }
                         RetryMethod::NoRetry => {
@@ -1761,6 +2091,7 @@ where
     /// *new pipeline*, so a reshard that displaces `N` commands costs one extra
     /// round trip per node rather than `N` sequential single-command requests.
     fn send_recv_and_retry_cmds(&self, cmds: &[Cmd]) -> RedisResult<Vec<Value>> {
+        self.refresh_slots_if_due();
         // Vector to hold the results, pre-populated with `Nil` values. This allows the original
         // cmd ordering to be re-established by inserting the response directly into the result
         // vector (e.g., results[10] = response).
@@ -1771,12 +2102,29 @@ where
 
         loop {
             let node_cmds = self.map_cmds_to_nodes(cmds, &pending)?;
-            let (sent, failed) = self.send_all_commands(&node_cmds);
+            let (sent, failed, refresh_after_connect_failure) = self.send_all_commands(&node_cmds);
             let failed = self.recv_all_commands(&mut results, &node_cmds, &sent, failed);
             self.report_pipeline_outcomes(&node_cmds, &failed);
 
             if failed.is_empty() {
                 return Ok(results);
+            }
+
+            let retry_as_pipeline = failed
+                .iter()
+                .all(|failure| Self::is_safe_to_retry_in_pipeline(&cmds[failure.pending.idx]));
+            // All replies have been drained. Preserve opportunistic recovery
+            // when this batch cannot retry; retryable read batches coalesce
+            // this request with the planner's other refresh requirements.
+            if refresh_after_connect_failure
+                && *self.auto_reconnect.borrow()
+                && (retries == self.cluster_params.retry_params.number_of_retries
+                    || !retry_as_pipeline
+                    || failed.iter().any(|failure| {
+                        matches!(failure.error.retry_method(), RetryMethod::NoRetry)
+                    }))
+            {
+                self.refresh_slots_after_error();
             }
 
             if !*self.auto_reconnect.borrow()
@@ -1792,10 +2140,7 @@ where
             // Regrouping read-only commands cannot change their effects. If any
             // failed command may mutate state, preserve the legacy path for the
             // whole failed set so retries retain their original ordering.
-            if !failed
-                .iter()
-                .all(|failure| Self::is_safe_to_retry_in_pipeline(&cmds[failure.pending.idx]))
-            {
+            if !retry_as_pipeline {
                 let mut single_retries = failed;
                 single_retries.sort_by_key(|failure| failure.pending.idx);
                 if let Some(failure) = single_retries
@@ -1821,7 +2166,8 @@ where
             }
             retries += 1;
 
-            pending = self.plan_pipeline_retry(cmds, failed, retries)?;
+            pending =
+                self.plan_pipeline_retry(cmds, failed, retries, refresh_after_connect_failure)?;
         }
     }
 
@@ -1854,7 +2200,10 @@ where
                 );
             }
         }
-        self.slots.borrow_mut().update_slots(moved_hints);
+        if !moved_hints.is_empty() {
+            self.slots.borrow_mut().update_slots(moved_hints);
+            self.slot_map_changed();
+        }
 
         failed
             .into_iter()
@@ -1908,10 +2257,13 @@ where
         cmds: &[Cmd],
         failed: Vec<PipelineCmdFailure>,
         retries: u32,
+        refresh_after_connect_failure: bool,
     ) -> RedisResult<Vec<PendingCmd>> {
         let mut pending = Vec::with_capacity(failed.len());
         let mut refresh_now = false;
         let mut refresh_rate_limited = false;
+        let mut refresh_after_error =
+            refresh_after_connect_failure && *self.auto_reconnect.borrow();
         let mut sleep_time = Duration::ZERO;
         let mut reconnect = HashSet::new();
         let mut reconnect_from_initial = HashSet::new();
@@ -1973,10 +2325,20 @@ where
                     }
                 }
                 RetryMethod::WaitAndRetry => {
+                    if Self::is_cluster_down(&err) {
+                        // A target that cannot serve slots must not override
+                        // the owner learned by the ensuing topology refresh.
+                        failed_cmd.redirect = None;
+                        refresh_after_error = true;
+                    }
                     // A command whose node reported it cannot serve
                     // (`LOADING`/`MASTERDOWN`) and that the health-tracking
                     // strategy now routes elsewhere retries without waiting.
+                    // A command with a redirect goes back to the redirect
+                    // target whatever the slot map says, so only an unpinned
+                    // command can be rerouted.
                     let rerouted = self.tracks_node_health
+                        && failed_cmd.redirect.is_none()
                         && ReadOutcome::is_node_unavailable(&err)
                         && self
                             .get_addr_for_cmd(&cmds[failed_cmd.idx])
@@ -2009,7 +2371,10 @@ where
             }
         }
 
-        self.slots.borrow_mut().update_slots(moved_hints);
+        if !moved_hints.is_empty() {
+            self.slots.borrow_mut().update_slots(moved_hints);
+            self.slot_map_changed();
+        }
         let unreachable_redirect_targets =
             self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
         if !unreachable_redirect_targets.is_empty() {
@@ -2033,14 +2398,16 @@ where
             // Never rate limit this one: it is the recovery mechanism, not an
             // optimisation.
             self.refresh_slots()?;
-        } else if refresh_rate_limited {
-            // Having learned the new mappings first-hand, the full refresh is only
-            // about replica and node-set freshness: safe to rate limit, and safe
-            // to fail. Every pending command carries its own recovery (a recorded
-            // hint, a pinned redirect, or a plain retry), so a refresh error —
-            // likely on exactly the busy, resharding cluster that triggered the
-            // redirects — must not fail the whole pipeline.
-            let _ = self.refresh_slots_rate_limited();
+        } else {
+            // Errors use their shorter refresh floor even when this round also
+            // received MOVED. If that floor suppresses the attempt, an eligible
+            // MOVED refresh can still run. Never attempt both in one round.
+            let error_refresh_attempted = refresh_after_error && self.refresh_slots_after_error();
+            if refresh_rate_limited && !error_refresh_attempted {
+                // MOVED hints already provide recovery; this full refresh is
+                // best-effort replica/node-set discovery and may fail safely.
+                let _ = self.refresh_slots_rate_limited();
+            }
         }
         if !sleep_time.is_zero() {
             thread::sleep(sleep_time);
@@ -2102,17 +2469,25 @@ where
 
     // Send each node its pipeline, retaining failures for only that node's
     // pending commands while allowing the other node pipelines to proceed.
-    fn send_all_commands(&self, node_cmds: &[NodeCmd]) -> (Vec<bool>, Vec<PipelineCmdFailure>) {
+    fn send_all_commands(
+        &self,
+        node_cmds: &[NodeCmd],
+    ) -> (Vec<bool>, Vec<PipelineCmdFailure>, bool) {
         let mut connections = self.connections.borrow_mut();
         let mut sent = vec![false; node_cmds.len()];
         let mut failed = Vec::new();
+        let mut refresh_after_connect_failure = false;
 
         let mut dropped_any = false;
         for (node_idx, nc) in node_cmds.iter().enumerate() {
-            match self
-                .get_connection_by_addr(&mut connections, &nc.addr)
-                .and_then(|conn| conn.send_packed_command(&nc.pipe))
-            {
+            let conn = self.get_connection_by_addr(&mut connections, &nc.addr);
+            let connection_failed = conn.is_err();
+            // Reconnect-class failures already have topology recovery in the
+            // retry planner. Acquisition timeouts otherwise only retry in place.
+            refresh_after_connect_failure |= conn
+                .as_ref()
+                .is_err_and(|err| matches!(err.retry_method(), RetryMethod::RetryImmediately));
+            match conn.and_then(|conn| conn.send_packed_command(&nc.pipe)) {
                 Ok(()) => sent[node_idx] = true,
                 Err(err) => {
                     // A failed write may have flushed part of the pipe, and the
@@ -2121,14 +2496,22 @@ where
                     // commands, so the socket must not go back into the pool,
                     // whatever the error's retry classification says.
                     dropped_any |= connections.remove(&nc.addr).is_some();
-                    failed.extend(nc.failures_from(err));
+                    let mut unresolved = nc.failures_from(err);
+                    if connection_failed {
+                        // The pipeline was never written, so a stale redirect
+                        // can safely yield to the refreshed slot map.
+                        for failure in &mut unresolved {
+                            failure.pending.redirect = None;
+                        }
+                    }
+                    failed.extend(unresolved);
                 }
             }
         }
         if dropped_any {
             self.notify_connections_changed(&connections);
         }
-        (sent, failed)
+        (sent, failed, refresh_after_connect_failure)
     }
 
     // Receive from each node, keeping the errors that ask to be retried alongside
@@ -2260,7 +2643,7 @@ where
 
 const MULTI: &[u8] = "*1\r\n$5\r\nMULTI\r\n".as_bytes();
 const ASKING: &[u8] = "*1\r\n$6\r\nASKING\r\n".as_bytes();
-impl<C: Connect + ConnectionLike + Send> ConnectionLike for ClusterConnection<C> {
+impl<C: Connect + ConnectionLike + Send + 'static> ConnectionLike for ClusterConnection<C> {
     fn supports_pipelining(&self) -> bool {
         false
     }
@@ -2449,6 +2832,188 @@ impl NodeCmd {
 /// run on a worker thread during parallel connection refresh without borrowing
 /// `&self`, which holds non-`Sync` `RefCell` state. The read/write timeouts are
 /// passed in by value so callers can read them out of their `RefCell`s up front.
+/// Fetches a topology for [`ClusterConnection::spawn_background_topology`],
+/// on its own thread and with its own connections, all bounded by the
+/// connection timeout.
+///
+/// Uses the first node whose `CLUSTER SLOTS` covers every slot (the same rule
+/// as `create_new_slots`), attaches availability zones for nodes the shared
+/// discovery cache does not know yet, and opens connections to the eager nodes
+/// the cluster connection lacks, so installing the result needs no I/O.
+fn prepare_topology<C: ConnectionLike + Connect + Send>(
+    params: &ClusterParams,
+    candidates: Vec<NodeAddress>,
+    connected: &HashSet<NodeAddress>,
+    (read_timeout, write_timeout): (Option<Duration>, Option<Duration>),
+    strategy: Option<Box<dyn ReadRoutingStrategy>>,
+    zone_cache: Option<Arc<dyn NodeAvailabilityZoneDiscoveryCache>>,
+) -> RedisResult<PreparedTopology<C>> {
+    let bound = params.connection_timeout;
+    let mut best: Option<(usize, Vec<SlotRange>, NodeAddress, C)> = None;
+    let mut last_error = None;
+    for addr in candidates {
+        let mut conn = match connect_node::<C>(&addr, params, Some(bound), Some(bound)) {
+            Ok(conn) => conn,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let parsed = conn
+            .req_command(&slot_cmd())
+            .and_then(|value| parse_slots(value, addr.host(), params.replica_filter.as_deref()));
+        match parsed {
+            Ok(slots) => {
+                let covered = slots
+                    .iter()
+                    .map(|range| usize::from(range.end - range.start) + 1)
+                    .sum::<usize>();
+                let complete = covered >= usize::from(SLOT_SIZE);
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_covered, ..)| covered > *best_covered)
+                {
+                    best = Some((covered, slots, addr, conn));
+                }
+                if complete {
+                    break;
+                }
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+    let Some((covered, slots, source_addr, mut source)) = best else {
+        return Err(last_error.unwrap_or_else(|| {
+            RedisError::from((
+                ErrorKind::Client,
+                "Slot refresh error. didn't get any slots from server",
+            ))
+        }));
+    };
+    if covered == 0 {
+        return Err(RedisError::from((
+            ErrorKind::Client,
+            "Slot refresh error. didn't get any slots from server",
+        )));
+    }
+    let mut new_slots = SlotMap::from_slots(slots);
+    let mut nodes: Vec<NodeAddress> = new_slots.values().flatten().cloned().collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+
+    if let Some(cache) = zone_cache {
+        let mut zones = cache.cached_zones(&nodes);
+        let missing = |zones: &std::collections::HashMap<NodeAddress, ArcStr>| {
+            nodes
+                .iter()
+                .filter(|node| !zones.contains_key(*node))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if !missing(&zones).is_empty() {
+            if let Ok(value) = source
+                .req_command(&shard_cmd())
+                .and_then(|value| value.extract_error())
+            {
+                for (node, zone) in
+                    parse_cluster_shards_availability_zones(&value, source_addr.host())
+                {
+                    zones.entry(node).or_insert(zone);
+                }
+            }
+        }
+        for node in missing(&zones) {
+            let zone = parse_hostname_availability_zone(node.host()).or_else(|| {
+                let mut conn = connect_node::<C>(&node, params, Some(bound), Some(bound)).ok()?;
+                let value = conn
+                    .req_command(&info_server_cmd())
+                    .and_then(|value| value.extract_error())
+                    .ok()?;
+                parse_info_server_availability_zone(&crate::from_redis_value::<String>(value).ok()?)
+            });
+            if let Some(zone) = zone {
+                zones.insert(node, zone);
+            }
+        }
+        cache.update_zones(&zones);
+        new_slots.set_node_availability_zones(zones);
+    }
+
+    let topology = new_slots.topology();
+    let eager: Vec<NodeAddress> = strategy
+        .as_deref()
+        .and_then(|strategy| {
+            strategy.on_topology_changed(topology.clone());
+            strategy.eager_connection_nodes(&topology)
+        })
+        .map(|nodes| nodes.into_iter().collect())
+        .unwrap_or(nodes);
+    let to_open: Vec<NodeAddress> = eager
+        .into_iter()
+        .filter(|node| !connected.contains(node))
+        .collect();
+    // Match the bounded fan-out used by refresh_connections, with a smaller
+    // background limit so a large topology does not create one thread per node.
+    let worker_count = to_open.len().min(MAX_BACKGROUND_CONCURRENT_CONNECTS);
+    let mut buckets: Vec<Vec<NodeAddress>> = (0..worker_count).map(|_| Vec::new()).collect();
+    for (i, addr) in to_open.into_iter().enumerate() {
+        buckets[i % worker_count].push(addr);
+    }
+    let connections = std::thread::scope(|scope| {
+        let handles: Vec<_> = buckets
+            .into_iter()
+            .map(|bucket| {
+                scope.spawn(move || {
+                    let mut opened = Vec::with_capacity(bucket.len());
+                    for addr in bucket {
+                        if let Ok(mut conn) =
+                            connect_node::<C>(&addr, params, read_timeout, write_timeout)
+                            && with_refresh_timeout(
+                                &mut conn,
+                                bound,
+                                read_timeout,
+                                C::check_connection,
+                            )
+                        {
+                            opened.push((addr, conn));
+                        }
+                    }
+                    opened
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .flatten()
+            .collect()
+    });
+    Ok(PreparedTopology {
+        slots: new_slots,
+        connections,
+    })
+}
+
+/// Runs one topology-refresh command on `conn` with its read timeout bounded
+/// by the connection timeout, then restores `configured`.
+///
+/// Refreshes touch every node in the eager set, not just the ones a caller
+/// reads from. Without a bound, a client with no response timeout would block
+/// on any stalled node during a refresh, spreading one node's stall to every
+/// thread that refreshes.
+fn with_refresh_timeout<C: Connect, T>(
+    conn: &mut C,
+    bound: Duration,
+    configured: Option<Duration>,
+    f: impl FnOnce(&mut C) -> T,
+) -> T {
+    let bounded = configured.map_or(bound, |configured| configured.min(bound));
+    let _ = conn.set_read_timeout(Some(bounded));
+    let out = f(conn);
+    let _ = conn.set_read_timeout(configured);
+    out
+}
+
 fn connect_node<C: ConnectionLike + Connect>(
     node: &NodeAddress,
     cluster_params: &ClusterParams,
@@ -2458,6 +3023,11 @@ fn connect_node<C: ConnectionLike + Connect>(
     let info = get_connection_info(node, cluster_params);
 
     let mut conn = C::connect(info, Some(cluster_params.connection_timeout))?;
+    // `connect` clears its handshake timeout when it returns. Keep the setup
+    // commands under it, so a node that accepts connections but never answers
+    // cannot block here: the configured response timeout is not applied yet.
+    conn.set_read_timeout(Some(cluster_params.connection_timeout))?;
+    conn.set_write_timeout(Some(cluster_params.connection_timeout))?;
     if cluster_params.read_routing_factory.is_some() {
         cmd("READONLY").exec(&mut conn)?;
     }
