@@ -62,9 +62,10 @@
 //! });
 //! let _: redis::Value = connection.route_command(&redis::cmd("PING"), routing_info).unwrap();
 //! ```
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -101,7 +102,7 @@ use crate::errors::{ErrorKind, RedisError, RetryMethod};
 use crate::parser::parse_redis_value;
 use crate::types::{HashMap, RedisResult, Value};
 use pipeline::UNROUTABLE_ERROR;
-use rand::{Rng, rng, seq::IteratorRandom};
+use rand::{Rng, rng, seq::IteratorRandom, seq::SliceRandom};
 
 pub use pipeline::{ClusterPipeline, cluster_pipe};
 
@@ -366,7 +367,27 @@ pub struct ClusterConnection<C = Connection> {
     /// When the next periodic refresh is due, or `None` when they are disabled.
     /// See [`Self::refresh_slots_if_due`].
     next_periodic_refresh: RefCell<Option<Instant>>,
+    /// A periodic refresh running on a background thread, if one is in flight.
+    pending_topology: RefCell<Option<PendingTopology<C>>>,
+    /// Bumped whenever this connection's slot map changes, so a background
+    /// refresh that started before the change is not adopted over it.
+    slot_map_generation: Cell<u64>,
     cluster_params: ClusterParams,
+}
+
+/// A periodic refresh in flight on a background thread.
+struct PendingTopology<C> {
+    /// `slot_map_generation` when the refresh started.
+    generation: u64,
+    result: mpsc::Receiver<RedisResult<PreparedTopology<C>>>,
+}
+
+/// A topology fetched off the request path, ready to install without I/O.
+struct PreparedTopology<C> {
+    /// The new slot map, with node availability zones already attached.
+    slots: SlotMap,
+    /// Connections opened to eager nodes the cluster connection did not have.
+    connections: Vec<(NodeAddress, C)>,
 }
 
 /// Minimum spacing between refreshes triggered by a node that cannot be
@@ -408,9 +429,10 @@ const MAX_CONCURRENT_CONNECTS: usize = 256;
 
 impl<C> ClusterConnection<C>
 where
-    // `Send` is required so connections can be opened on worker threads during
-    // parallel connection refresh (see `refresh_slots`).
-    C: ConnectionLike + Connect + Send,
+    // `Send + 'static` is required so connections can be opened on worker
+    // threads during parallel connection refresh (see `refresh_slots`) and by
+    // the background periodic refresh (see `refresh_slots_if_due`).
+    C: ConnectionLike + Connect + Send + 'static,
 {
     pub(crate) fn new(
         cluster_params: ClusterParams,
@@ -441,6 +463,8 @@ where
             next_slot_refresh: RefCell::new(None),
             next_error_refresh: RefCell::new(None),
             next_periodic_refresh: RefCell::new(None),
+            pending_topology: RefCell::new(None),
+            slot_map_generation: Cell::new(0),
             initial_nodes: initial_nodes.to_vec(),
             cluster_params,
         };
@@ -637,13 +661,118 @@ where
     }
 
     /// Refreshes the whole slot map if the periodic refresh is due.
+    ///
+    /// The refresh itself runs on a background thread with its own
+    /// connections: it may have to wait on a node that has stopped answering,
+    /// and the command that happens to find it due must not wait with it. That
+    /// command only starts it; a later command installs the result, which
+    /// involves no I/O.
     fn refresh_slots_if_due(&self) {
+        self.install_background_topology();
         let due = (*self.next_periodic_refresh.borrow()).is_some_and(|next| Instant::now() >= next);
-        if due {
-            // A failed periodic refresh keeps the current map; refresh_slots has
-            // already re-armed the deadline, so it is not retried on every command.
-            let _ = self.refresh_slots();
+        if !due || self.pending_topology.borrow().is_some() {
+            return;
         }
+        self.arm_periodic_refresh(Instant::now());
+        self.spawn_background_topology();
+    }
+
+    fn spawn_background_topology(&self) {
+        let connected: HashSet<NodeAddress> = self.connections.borrow().keys().cloned().collect();
+        // Ask the nodes this connection already reaches, in random order so
+        // connections do not all start with the same node, then the seeds.
+        let mut candidates: Vec<NodeAddress> = connected.iter().cloned().collect();
+        candidates.shuffle(&mut rng());
+        for info in &self.initial_nodes {
+            if let Ok(addr) = NodeAddress::try_from(&info.addr) {
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+        }
+        let params = self.cluster_params.clone();
+        let timeouts = (*self.read_timeout.borrow(), *self.write_timeout.borrow());
+        let fallback_cache: Arc<dyn NodeAvailabilityZoneDiscoveryCache> = self.az_discovery.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name("redis-topology-refresh".to_owned())
+            .spawn(move || {
+                // The receiver is gone if the connection was dropped meanwhile.
+                let _ = tx.send(prepare_topology::<C>(
+                    &params,
+                    candidates,
+                    &connected,
+                    timeouts,
+                    fallback_cache,
+                ));
+            });
+        if spawned.is_ok() {
+            *self.pending_topology.borrow_mut() = Some(PendingTopology {
+                generation: self.slot_map_generation.get(),
+                result: rx,
+            });
+        }
+    }
+
+    /// Installs a finished background refresh, if there is one. Discards it
+    /// when this connection's slot map changed after the refresh started: a
+    /// MOVED hint or an error-driven refresh since then is newer information.
+    fn install_background_topology(&self) {
+        let finished = {
+            let pending = self.pending_topology.borrow();
+            let Some(pending) = pending.as_ref() else {
+                return;
+            };
+            match pending.result.try_recv() {
+                Ok(result) => Some((pending.generation, result)),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        *self.pending_topology.borrow_mut() = None;
+        let Some((generation, Ok(prepared))) = finished else {
+            return;
+        };
+        if generation != self.slot_map_generation.get() {
+            return;
+        }
+
+        let all_nodes =
+            || -> HashSet<NodeAddress> { prepared.slots.values().flatten().cloned().collect() };
+        let eager = match &self.routing_strategy {
+            Some(strategy) => {
+                let topology = prepared.slots.topology();
+                strategy.on_topology_changed(topology.clone());
+                strategy
+                    .eager_connection_nodes(&topology)
+                    .unwrap_or_else(all_nodes)
+            }
+            None => all_nodes(),
+        };
+        *self.slots.borrow_mut() = prepared.slots;
+        self.slot_map_changed();
+        // A full map was just learned; MOVED hints need not refetch one.
+        self.arm_slot_refresh_deadline();
+
+        let mut connections = self.connections.borrow_mut();
+        connections.retain(|addr, _| eager.contains(addr));
+        for (addr, conn) in prepared.connections {
+            if eager.contains(&addr) {
+                connections.entry(addr).or_insert(conn);
+            }
+        }
+        self.notify_connections_changed(&connections);
+    }
+
+    fn slot_map_changed(&self) {
+        self.slot_map_generation
+            .set(self.slot_map_generation.get().wrapping_add(1));
+    }
+
+    fn arm_periodic_refresh(&self, now: Instant) {
+        let interval = self.cluster_params.periodic_topology_refresh;
+        *self.next_periodic_refresh.borrow_mut() =
+            (!interval.is_zero()).then(|| now + interval.mul_f64(rng().random_range(0.75..1.25)));
     }
 
     /// Arms the error and periodic refresh deadlines. Called by every full
@@ -653,9 +782,7 @@ where
         let now = Instant::now();
         *self.next_error_refresh.borrow_mut() =
             Some(now + ERROR_REFRESH_FLOOR.mul_f64(rng().random_range(0.5..1.5)));
-        let interval = self.cluster_params.periodic_topology_refresh;
-        *self.next_periodic_refresh.borrow_mut() =
-            (!interval.is_zero()).then(|| now + interval.mul_f64(rng().random_range(0.75..1.25)));
+        self.arm_periodic_refresh(now);
     }
 
     // Query a node to discover slot-> master mappings.
@@ -681,6 +808,7 @@ where
             nodes.dedup();
 
             *self.slots.borrow_mut() = new_slots;
+            self.slot_map_changed();
             self.refresh_connections(nodes);
             return Ok(());
         }
@@ -690,6 +818,7 @@ where
         nodes.dedup();
 
         *self.slots.borrow_mut() = new_slots;
+        self.slot_map_changed();
         self.refresh_connections(nodes);
 
         Ok(())
@@ -1693,6 +1822,7 @@ where
                     self.get_connection_by_addr(&mut connections, &addr)?;
                 }
                 self.slots.borrow_mut().update_slot(slot, addr);
+                self.slot_map_changed();
                 self.refresh_slots_rate_limited()?;
             }
 
@@ -2009,6 +2139,7 @@ where
             }
         }
         self.slots.borrow_mut().update_slots(moved_hints);
+        self.slot_map_changed();
 
         failed
             .into_iter()
@@ -2170,6 +2301,7 @@ where
         }
 
         self.slots.borrow_mut().update_slots(moved_hints);
+        self.slot_map_changed();
         let unreachable_redirect_targets =
             self.recover_pipeline_connections(&reconnect, &reconnect_from_initial);
         if !unreachable_redirect_targets.is_empty() {
@@ -2422,7 +2554,7 @@ where
 
 const MULTI: &[u8] = "*1\r\n$5\r\nMULTI\r\n".as_bytes();
 const ASKING: &[u8] = "*1\r\n$6\r\nASKING\r\n".as_bytes();
-impl<C: Connect + ConnectionLike + Send> ConnectionLike for ClusterConnection<C> {
+impl<C: Connect + ConnectionLike + Send + 'static> ConnectionLike for ClusterConnection<C> {
     fn supports_pipelining(&self) -> bool {
         false
     }
@@ -2611,6 +2743,158 @@ impl NodeCmd {
 /// run on a worker thread during parallel connection refresh without borrowing
 /// `&self`, which holds non-`Sync` `RefCell` state. The read/write timeouts are
 /// passed in by value so callers can read them out of their `RefCell`s up front.
+/// Fetches a topology for [`ClusterConnection::spawn_background_topology`],
+/// on its own thread and with its own connections, all bounded by the
+/// connection timeout.
+///
+/// Uses the first node whose `CLUSTER SLOTS` covers every slot (the same rule
+/// as `create_new_slots`), attaches availability zones for nodes the shared
+/// discovery cache does not know yet, and opens connections to the eager nodes
+/// the cluster connection lacks, so installing the result needs no I/O.
+fn prepare_topology<C: ConnectionLike + Connect + Send>(
+    params: &ClusterParams,
+    candidates: Vec<NodeAddress>,
+    connected: &HashSet<NodeAddress>,
+    (read_timeout, write_timeout): (Option<Duration>, Option<Duration>),
+    fallback_cache: Arc<dyn NodeAvailabilityZoneDiscoveryCache>,
+) -> RedisResult<PreparedTopology<C>> {
+    let bound = params.connection_timeout;
+    let mut best: Option<(usize, Vec<SlotRange>, NodeAddress, C)> = None;
+    let mut last_error = None;
+    for addr in candidates {
+        let mut conn = match connect_node::<C>(&addr, params, Some(bound), Some(bound)) {
+            Ok(conn) => conn,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let parsed = conn
+            .req_command(&slot_cmd())
+            .and_then(|value| parse_slots(value, addr.host(), params.replica_filter.as_deref()));
+        match parsed {
+            Ok(slots) => {
+                let covered = slots
+                    .iter()
+                    .map(|range| usize::from(range.end - range.start) + 1)
+                    .sum::<usize>();
+                let complete = covered >= usize::from(SLOT_SIZE);
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_covered, ..)| covered > *best_covered)
+                {
+                    best = Some((covered, slots, addr, conn));
+                }
+                if complete {
+                    break;
+                }
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+    let Some((covered, slots, source_addr, mut source)) = best else {
+        return Err(last_error.unwrap_or_else(|| {
+            RedisError::from((
+                ErrorKind::Client,
+                "Slot refresh error. didn't get any slots from server",
+            ))
+        }));
+    };
+    if covered == 0 {
+        return Err(RedisError::from((
+            ErrorKind::Client,
+            "Slot refresh error. didn't get any slots from server",
+        )));
+    }
+    let mut new_slots = SlotMap::from_slots(slots);
+    let mut nodes: Vec<NodeAddress> = new_slots.values().flatten().cloned().collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+
+    let strategy = params
+        .read_routing_factory
+        .as_ref()
+        .map(|factory| factory.create_strategy());
+    if let Some(strategy) = strategy
+        .as_deref()
+        .filter(|s| s.requires_node_availability_zones())
+    {
+        let cache = strategy
+            .node_availability_zone_discovery_cache()
+            .unwrap_or(fallback_cache);
+        let mut zones = cache.cached_zones(&nodes);
+        let missing = |zones: &std::collections::HashMap<NodeAddress, ArcStr>| {
+            nodes
+                .iter()
+                .filter(|node| !zones.contains_key(*node))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if !missing(&zones).is_empty() {
+            if let Ok(value) = source
+                .req_command(&shard_cmd())
+                .and_then(|value| value.extract_error())
+            {
+                for (node, zone) in
+                    parse_cluster_shards_availability_zones(&value, source_addr.host())
+                {
+                    zones.entry(node).or_insert(zone);
+                }
+            }
+        }
+        for node in missing(&zones) {
+            let zone = parse_hostname_availability_zone(node.host()).or_else(|| {
+                let mut conn = connect_node::<C>(&node, params, Some(bound), Some(bound)).ok()?;
+                let value = conn
+                    .req_command(&info_server_cmd())
+                    .and_then(|value| value.extract_error())
+                    .ok()?;
+                parse_info_server_availability_zone(&crate::from_redis_value::<String>(value).ok()?)
+            });
+            if let Some(zone) = zone {
+                zones.insert(node, zone);
+            }
+        }
+        cache.update_zones(&zones);
+        new_slots.set_node_availability_zones(zones);
+    }
+
+    let topology = new_slots.topology();
+    let eager: Vec<NodeAddress> = strategy
+        .as_deref()
+        .and_then(|strategy| {
+            strategy.on_topology_changed(topology.clone());
+            strategy.eager_connection_nodes(&topology)
+        })
+        .map(|nodes| nodes.into_iter().collect())
+        .unwrap_or(nodes);
+    let to_open: Vec<NodeAddress> = eager
+        .into_iter()
+        .filter(|node| !connected.contains(node))
+        .collect();
+    let connections = std::thread::scope(|scope| {
+        let handles: Vec<_> = to_open
+            .iter()
+            .map(|addr| {
+                scope.spawn(move || {
+                    let mut conn =
+                        connect_node::<C>(addr, params, read_timeout, write_timeout).ok()?;
+                    with_refresh_timeout(&mut conn, bound, read_timeout, C::check_connection)
+                        .then(|| (addr.clone(), conn))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().flatten())
+            .collect()
+    });
+    Ok(PreparedTopology {
+        slots: new_slots,
+        connections,
+    })
+}
+
 /// Runs one topology-refresh command on `conn` with its read timeout bounded
 /// by the connection timeout, then restores `configured`.
 ///
@@ -2640,6 +2924,11 @@ fn connect_node<C: ConnectionLike + Connect>(
     let info = get_connection_info(node, cluster_params);
 
     let mut conn = C::connect(info, Some(cluster_params.connection_timeout))?;
+    // `connect` clears its handshake timeout when it returns. Keep the setup
+    // commands under it, so a node that accepts connections but never answers
+    // cannot block here: the configured response timeout is not applied yet.
+    conn.set_read_timeout(Some(cluster_params.connection_timeout))?;
+    conn.set_write_timeout(Some(cluster_params.connection_timeout))?;
     if cluster_params.read_routing_factory.is_some() {
         cmd("READONLY").exec(&mut conn)?;
     }

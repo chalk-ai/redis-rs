@@ -444,8 +444,10 @@ impl ClusterClientBuilder {
     /// Defaults to 60 seconds, jittered so pooled connections do not refresh
     /// together. Without periodic refreshes a connection only learns about
     /// changes that cause it an error or a redirect, so it never uses a replica
-    /// added after it connected. The refresh runs on the thread of the first
-    /// command issued after the interval elapses.
+    /// added after it connected. The refresh runs on a background thread with
+    /// its own connections, started by the first command after the interval
+    /// elapses, so a node that has stopped answering delays the refresh rather
+    /// than that command; a later command installs the result without I/O.
     ///
     /// [`Duration::ZERO`] disables periodic refreshes.
     pub fn periodic_topology_refresh(mut self, interval: Duration) -> ClusterClientBuilder {
@@ -905,7 +907,7 @@ impl ClusterClient {
     #[doc(hidden)]
     pub fn get_generic_connection<C>(&self) -> RedisResult<cluster::ClusterConnection<C>>
     where
-        C: crate::ConnectionLike + crate::cluster::Connect + Send,
+        C: crate::ConnectionLike + crate::cluster::Connect + Send + 'static,
     {
         cluster::ClusterConnection::new(self.cluster_params.clone(), self.initial_nodes.clone())
     }
@@ -916,7 +918,7 @@ impl ClusterClient {
         config: cluster::ClusterConfig,
     ) -> RedisResult<cluster::ClusterConnection<C>>
     where
-        C: crate::ConnectionLike + crate::cluster::Connect + Send,
+        C: crate::ConnectionLike + crate::cluster::Connect + Send + 'static,
     {
         cluster::ClusterConnection::new(
             self.cluster_params.clone().with_config(config),

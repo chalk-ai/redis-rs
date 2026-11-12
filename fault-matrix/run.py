@@ -486,6 +486,15 @@ def fault_add_replica(c: Clock, cluster: Cluster) -> None:
     c.wait_until(100, lambda: (lambda i: i.get("loading") == 0 and i.get("master_link_status") == "up")(node(7120, 1).info("all")), "new_replica_synced")
 
 
+def fault_hung_replica(c: Clock, cluster: Cluster) -> None:
+    # Holds every reply from 7102 forever. New connections still complete the
+    # TCP handshake (toxiproxy accepts them), so only a timeout ends a command.
+    c.at(FAULT_AT)
+    httpx.post(f"http://127.0.0.1:{TOXI_PORT}/proxies/victim/toxics", json={
+        "name": "hang", "type": "timeout", "stream": "downstream", "attributes": {"timeout": 0}}).raise_for_status()
+    c.mark("replica_hung")
+
+
 def fault_remove_replica(c: Clock, cluster: Cluster) -> None:
     victim_id = node(VICTIM, 1).execute_command("CLUSTER", "MYID").decode()
     c.at(FAULT_AT)
@@ -569,6 +578,14 @@ SCENARIOS = [
     Scenario("add_replica", "A second us-east-1a replica joins shard A and fully syncs.",
              TWO, 160, fault_add_replica, [
                  Check("reads served by the new replica after it synced", lambda r: r.node_gets(7120, r.event("new_replica_synced"), 159), ">=", 1, "reads", "pass"),
+             ]),
+    # 110 s so every connection runs a periodic refresh (default 60 s, jittered
+    # down to 45 s) while the replica is hung.
+    Scenario("hung_replica", "The lone us-east-1a replica keeps accepting connections but never answers again; every client keeps running periodic topology refreshes.",
+             TWO, 110, fault_hung_replica, [
+                 Check("threads stuck when the run ends", lambda r: r.harness["threads_stuck_at_end"], "<=", 0, "threads", "pass"),
+                 Check("hung thread-seconds, all zones", lambda r: r.hung_thread_s(FAULT_AT, r.duration), "<=", 5, "thread-s", "pass"),
+                 Check("us-east-1a reads lost", lambda r: r.lost_pct("reads", A1, FAULT_AT + 5, 105), "<=", 5, "%", "pass"),
              ]),
     Scenario("remove_replica", "The lone us-east-1a replica of shard A is shut down and forgotten by every node; its address refuses connections.",
              TWO, 45, fault_remove_replica, [

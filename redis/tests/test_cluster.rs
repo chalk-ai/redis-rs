@@ -2575,17 +2575,78 @@ mod cluster {
         assert!(!ports.lock().unwrap().contains(&6385));
 
         // The cluster gains a same-zone replica. No command fails or redirects,
-        // so only a periodic refresh can reveal it.
+        // so only a periodic refresh can reveal it. The refresh runs in the
+        // background and a later command installs it.
         added.store(true, atomic::Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(200));
         ports.lock().unwrap().clear();
-        for _ in 0..4 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ports.lock().unwrap().contains(&6385) && std::time::Instant::now() < deadline {
             let _: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
             ports.lock().unwrap().contains(&6385),
             "{:?}",
             ports.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_cluster_periodic_topology_refresh_does_not_block_on_a_hung_node() {
+        // Shard 2's primary stops answering for 1.5 s at a time. It is in every
+        // refresh's connection set, but reads of shard 1 never touch it, so no
+        // read may wait on it, however often the topology refreshes.
+        let name = "test_cluster_periodic_topology_refresh_does_not_block_on_a_hung_node";
+        let hung = Arc::new(atomic::AtomicBool::new(false));
+        let hung_clone = hung.clone();
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .periodic_topology_refresh(std::time::Duration::from_millis(50))
+                .read_from_zonal_replicas("us-east-1b"),
+            name,
+            move |cmd: &[u8], port| {
+                if port == 6382 && hung_clone.load(atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                }
+                let slots = refresh_test_slots(false, false);
+                if is_connection_check(cmd) {
+                    return Err(Ok(redis_value!(simple:"OK")));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return respond_startup_with_replica_using_config(name, cmd, Some(slots));
+                }
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SHARDS") {
+                    return Err(Ok(cluster_shards_with_zones(
+                        name,
+                        &slots,
+                        &REFRESH_TEST_ZONES,
+                    )));
+                }
+                if contains_slice(cmd, b"GET") {
+                    return Err(Ok(redis_value!("123")));
+                }
+                Ok(())
+            },
+        );
+
+        hung.store(true, atomic::Ordering::SeqCst);
+        let mut slowest = std::time::Duration::ZERO;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < until {
+            let started = std::time::Instant::now();
+            let value: Option<i32> = cmd("GET").arg("test").query(&mut connection).unwrap();
+            assert_eq!(value, Some(123));
+            slowest = slowest.max(started.elapsed());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        hung.store(false, atomic::Ordering::SeqCst);
+        assert!(
+            slowest < std::time::Duration::from_millis(300),
+            "a read waited {slowest:?}"
         );
     }
 

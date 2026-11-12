@@ -1,7 +1,7 @@
 name: Cluster fault matrix
 
 # Boots real Valkey clusters and injects faults; see fault-matrix/README.md.
-# About 20 minutes, so it runs nightly and on demand rather than on every push.
+# About 30 minutes, so it runs nightly and on demand rather than on every push.
 on:
   workflow_dispatch:
     inputs:

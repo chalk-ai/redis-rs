@@ -24,7 +24,7 @@ Requirements:
 # With nix:
 nix shell nixpkgs#valkey nixpkgs#toxiproxy nixpkgs#uv
 
-fault-matrix/run.py                    # every scenario, about 20 minutes
+fault-matrix/run.py                    # every scenario, about 30 minutes
 fault-matrix/run.py resync failover    # a subset
 fault-matrix/run.py --list             # scenarios and their checks
 fault-matrix/run.py --response-timeout-ms none   # without a response timeout
@@ -82,6 +82,7 @@ Every check has one of three expectations:
 | `reshard_down` | A shard is drained and its nodes terminated | pass |
 | `reshard_down_reset` | Same, but the drained nodes stay up answering `CLUSTERDOWN` | pass |
 | `add_replica` | A second 1a replica joins shard A | pass |
+| `hung_replica` | The lone 1a replica accepts connections but never answers again, through several periodic refreshes | pass |
 | `remove_replica` | The lone 1a replica is removed | pass |
 
 `fault-matrix/run.py --list` prints the exact thresholds.
